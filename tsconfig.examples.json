@@ -1,0 +1,17 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "strict": true,
+    "skipLibCheck": true,
+    "noEmit": true,
+    "baseUrl": ".",
+    "paths": {
+      "freestyle-volumes": ["src/index.ts"],
+      "freestyle-volumes/freestyle": ["src/freestyle.ts"],
+      "freestyle-volumes/docker": ["src/docker.ts"]
+    }
+  },
+  "include": ["examples/*.ts"]
+}
