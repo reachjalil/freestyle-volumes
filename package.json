@@ -1,0 +1,79 @@
+{
+  "name": "freestyle-volumes",
+  "version": "0.1.0",
+  "description": "Daytona-style persistent volumes for Freestyle VMs, backed by S3-compatible object storage through an rclone FUSE mount",
+  "type": "module",
+  "license": "MIT",
+  "engines": {
+    "node": ">=22"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./freestyle": {
+      "types": "./dist/freestyle.d.ts",
+      "import": "./dist/freestyle.js"
+    },
+    "./docker": {
+      "types": "./dist/docker.d.ts",
+      "import": "./dist/docker.js"
+    },
+    "./git": {
+      "types": "./dist/git.d.ts",
+      "import": "./dist/git.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "prepare": "tsc -p tsconfig.json",
+    "test": "pnpm build && node --test test/unit/*.test.mjs",
+    "test:integration": "pnpm build && node --test --test-concurrency=1 test/integration/*.test.mjs",
+    "test:freestyle": "pnpm build && node --test --test-concurrency=1 test/freestyle/*.test.mjs",
+    "check:types": "tsc --noEmit --target ES2022 --module NodeNext --moduleResolution NodeNext --strict --skipLibCheck --noUncheckedIndexedAccess test/types/freestyle-sdk.ts",
+    "check:examples": "tsc -p tsconfig.examples.json",
+    "prepack": "pnpm build"
+  },
+  "dependencies": {
+    "@aws-sdk/client-s3": "3.1135.0"
+  },
+  "peerDependencies": {
+    "freestyle": ">=0.2.0"
+  },
+  "peerDependenciesMeta": {
+    "freestyle": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@types/node": "22.18.6",
+    "freestyle": "0.2.13",
+    "typescript": "5.9.3"
+  },
+  "packageManager": "pnpm@10.15.1",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/reachjalil/freestyle-volumes.git"
+  },
+  "bugs": {
+    "url": "https://github.com/reachjalil/freestyle-volumes/issues"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "keywords": [
+    "freestyle",
+    "sandbox",
+    "volumes",
+    "s3",
+    "rclone",
+    "fuse",
+    "daytona"
+  ]
+}
