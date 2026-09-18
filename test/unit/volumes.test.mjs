@@ -1,6 +1,11 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { FreestyleVolumes, MemoryObjectStore, VolumeError, StorageError, ValidationError, VolumeNotFoundError } from '../../dist/index.js';
+import { mkdtemp, mkdir, writeFile, readFile, rm, symlink, realpath } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
+import { FreestyleVolumes, MemoryObjectStore, VolumeError, StorageError, ValidationError, VolumeNotFoundError, mountIdFor, mountScript, shellQuote } from '../../dist/index.js';
 import { FakeSandbox, fakeResolver, storage, BOOTSTRAP_OK, MOUNT_OK, MOUNT_ALREADY } from '../helpers/fake-sandbox.mjs';
 
 function setup(responses = [], options = {}) {
@@ -18,6 +23,67 @@ test('constructor validates its inputs', () => {
   assert.throws(() => setup([], { defaults: { writeBackSeconds: -1 } }), ValidationError);
 });
 
+test('optional tuning stays absent by default and attach overrides inherited settings without forcing full cache', async () => {
+  const specs = [];
+  const backend = {
+    ensureRuntime: async () => {},
+    mount: async (_sandbox, spec) => { specs.push(spec); return { pid: 42, alreadyAttached: false }; },
+  };
+  const keys = ['bufferSize', 'readAhead', 'readChunkSize', 'readChunkSizeLimit', 'transfers'];
+  const plain = setup([], { backend });
+  await plain.volumes.create({ name: 'data' });
+  await plain.volumes.attach({ sandboxId: 'vm-1', volumeId: 'data', mountPath: '/mnt/plain' });
+  for (const key of keys) {
+    assert.equal(Object.hasOwn(plain.volumes.defaults, key), false);
+    assert.equal(Object.hasOwn(specs[0], key), false);
+  }
+
+  const defaults = { bufferSize: '16M', readAhead: '1GiB', readChunkSize: '128M', readChunkSizeLimit: 'off', transfers: 4 };
+  const tuned = setup([], { backend, defaults });
+  await tuned.volumes.create({ name: 'data' });
+  await tuned.volumes.attach({ sandboxId: 'vm-1', volumeId: 'data', mountPath: '/mnt/inherited', bufferSize: undefined });
+  for (const key of keys) assert.equal(specs[1][key], defaults[key]);
+  assert.equal(specs[1].cacheMode, 'writes', 'readAhead must not force full cache');
+  const overrides = { bufferSize: '0B', readAhead: '0K', readChunkSize: '2MiB', readChunkSizeLimit: '512M', transfers: 64 };
+  await tuned.volumes.attach({ sandboxId: 'vm-1', volumeId: 'data', mountPath: '/mnt/override', ...overrides });
+  for (const key of keys) {
+    assert.equal(specs[2][key], overrides[key]);
+    assert.equal(tuned.volumes.defaults[key], defaults[key], 'attach does not mutate defaults');
+  }
+});
+
+test('tuning sizes require explicit units and invalid tuning fails before any storage or guest calls', async () => {
+  const { store, sandbox, volumes } = setup();
+  store.getObject = async () => assert.fail('invalid tuning must fail before registry reads');
+  const invalid = ['', '0', '16', 16, null, '-1M', '+1M', 'NaNM', 'InfinityB', '1e3K', '1MB/s', ' 1M', '1M\n', '1M;id', '8E', '999999999999999999999999B'];
+  for (const key of ['bufferSize', 'readAhead', 'readChunkSize', 'readChunkSizeLimit']) {
+    for (const value of [...invalid, ...(key === 'readChunkSizeLimit' ? ['OFF'] : ['off'])]) {
+      assert.throws(() => setup([], { defaults: { [key]: value } }), ValidationError);
+      await assert.rejects(volumes.attach({ sandboxId: 'vm-1', volumeId: 'data', mountPath: '/mnt/x', [key]: value }), ValidationError);
+    }
+    for (const value of ['0B', '0M', '1B', '512K', '1.5M', '2G', '1T', '1P', '1E', '16KiB', '1MB', '1g']) {
+      assert.equal(setup([], { defaults: { [key]: value } }).volumes.defaults[key], value);
+    }
+  }
+  for (const transfers of [0, -1, 65, 1.5, '4', null, NaN, Infinity]) {
+    assert.throws(() => setup([], { defaults: { transfers } }), ValidationError);
+    await assert.rejects(volumes.attach({ sandboxId: 'vm-1', volumeId: 'data', mountPath: '/mnt/x', transfers }), ValidationError);
+  }
+  assert.equal(setup([], { defaults: { transfers: 1 } }).volumes.defaults.transfers, 1);
+  assert.equal(sandbox.calls.length, 0);
+});
+
+test('public tuning reaches rclone daemon flags and VFS mount JSON', async () => {
+  const { volumes, sandbox } = setup([BOOTSTRAP_OK, MOUNT_OK]);
+  await volumes.create({ name: 'data' });
+  await volumes.attach({ sandboxId: 'vm-1', volumeId: 'data', mountPath: '/mnt/data', cacheMode: 'full', bufferSize: '8M', readAhead: '32M', readChunkSize: '64M', readChunkSizeLimit: 'off', transfers: 3 });
+  const command = sandbox.calls[1].command;
+  assert.ok(command.includes(`DAEMON_FLAGS=${shellQuote("'--buffer-size' '8M' '--transfers' '3'")}`));
+  assert.match(command, /"ReadAhead":"32M"/);
+  assert.match(command, /"ChunkSize":"64M"/);
+  assert.match(command, /"ChunkSizeLimit":"off"/);
+});
+
 test('attach checks storage before touching the sandbox, passes credentials only via env, and records the attachment', async () => {
   const { store, sandbox, volumes, events } = setup([BOOTSTRAP_OK, MOUNT_OK]);
   await volumes.create({ name: 'data' });
@@ -32,8 +98,8 @@ test('attach checks storage before touching the sandbox, passes credentials only
   assert.equal(mount.env.RCLONE_CONFIG_FSVOL_ENDPOINT, storage.sandboxEndpoint);
   assert.doesNotMatch(mount.command, new RegExp(storage.secretAccessKey));
   assert.doesNotMatch(mount.command, new RegExp(storage.accessKeyId));
-  assert.match(mount.command, /fsvol:test-bucket\/tenant-a\/v\/data/);
-  assert.match(mount.command, /--uid 1000 --gid 1000/);
+  assert.ok(mount.command.includes(`fsvol:test-bucket/${(await volumes.get('data')).dataPrefix}`));
+  assert.match(mount.command, /"UID":1000,"GID":1000/);
   assert.ok(mount.timeoutMs <= 300000);
   const records = await volumes.registry.listAttachments('data');
   assert.equal(records.length, 1);
@@ -52,8 +118,8 @@ test('attach with subpath mounts a sub-prefix and validates traversal', async ()
   assert.equal(sandbox.calls.length, 0, 'validation happens before any sandbox call');
   const attachment = await volumes.attach({ sandboxId: 'vm-1', volumeId: 'data', mountPath: '/mnt/alice', subpath: 'users/alice', readOnly: true });
   assert.equal(attachment.subpath, 'users/alice');
-  assert.match(sandbox.calls[1].command, /fsvol:test-bucket\/tenant-a\/v\/data\/users\/alice/);
-  assert.match(sandbox.calls[1].command, /--read-only/);
+  assert.ok(sandbox.calls[1].command.includes(`fsvol:test-bucket/${(await volumes.get('data')).dataPrefix}/users/alice`));
+  assert.match(sandbox.calls[1].command, /"ReadOnly":true/);
 });
 
 test('attach is idempotent and reports alreadyAttached', async () => {
@@ -156,4 +222,80 @@ test('get with create is idempotent and list reflects the namespace', async () =
   assert.equal(a.createdAt, b.createdAt);
   await assert.rejects(volumes.get('other'), VolumeNotFoundError);
   assert.deepEqual((await volumes.list()).map((v) => v.id), ['cache']);
+});
+
+test('attach uses full storage identity for state and cache, independently of credentials', async () => {
+  const store = new MemoryObjectStore();
+  const attach = async config => {
+    const { volumes, sandbox } = setup([BOOTSTRAP_OK, MOUNT_OK], { storage: config, objectStore: store });
+    const volume = await volumes.create({ name: 'data', ifNotExists: true });
+    const result = await volumes.attach({ sandboxId: 'vm-1', volumeId: 'data', mountPath: '/mnt/data' });
+    assert.equal(result.mountId, mountIdFor('data', undefined, '/mnt/data', volumes.storage, volume.generation));
+    assert.match(sandbox.calls[1].command, new RegExp(`MID='${result.mountId}'`));
+    return result.mountId;
+  };
+  const original = await attach(storage);
+  assert.notEqual(original, await attach({ ...storage, endpoint: 'https://other.example' }));
+  assert.notEqual(original, await attach({ ...storage, sandboxEndpoint: 'https://other-guest.example' }));
+  assert.equal(original, await attach({ ...storage, accessKeyId: 'new-key', secretAccessKey: 'new-secret', sessionToken: 'new-token' }));
+});
+
+test('unflushed detach retains the attachment and guards deletion, including after an absent retry', async () => {
+  const { volumes, sandbox } = setup([BOOTSTRAP_OK, MOUNT_OK]);
+  await volumes.create({ name: 'data' });
+  const attachment = await volumes.attach({ sandboxId: 'vm-1', volumeId: 'data', mountPath: '/mnt/data' });
+  sandbox.responses.push({ stdout: `FSVOL_RESULT status=detached flushed=0 pending=-1 volume=data mid=${attachment.mountId} ro=0\n` }, { stdout: 'FSVOL_RESULT status=absent\n' });
+  const detached = await volumes.detach({ sandboxId: 'vm-1', mountPath: '/mnt/data', force: true });
+  assert.equal(detached.flushed, false);
+  assert.equal(detached.pendingUploads, null);
+  assert.equal((await volumes.registry.listAttachments('data')).length, 1);
+  await volumes.detach({ sandboxId: 'vm-1', mountPath: '/mnt/data' });
+  await assert.rejects(volumes.delete({ volumeId: 'data', confirm: 'data' }), e => e.code === 'VOLUME_IN_USE');
+});
+
+// Execute the generated shell's identity checks while mocking Linux mount and
+// process introspection. Both endpoints deliberately expose the same S3 path.
+test('guest rejects healthy and stale mounts from another storage identity without rebinding cache', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'fv-identity-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const paths = { stateRoot: join(root, 's'), cacheRoot: join(root, 'c'), runRoot: join(root, 'r'), binDir: join(root, 'b') };
+  const { volumes } = setup();
+  const oldId = mountIdFor('data', undefined, '/mnt/data', volumes.storage);
+  const newId = mountIdFor('data', undefined, '/mnt/data', { ...volumes.storage, sandboxEndpoint: 'https://other.example' });
+  const sd = join(paths.stateRoot, 'mounts', oldId);
+  const cache = join(paths.cacheRoot, oldId);
+  await mkdir(sd, { recursive: true });
+  await mkdir(cache, { recursive: true });
+  const state = JSON.stringify({ mountId: oldId, mountPath: '/mnt/data', volumeId: 'data' });
+  await writeFile(join(sd, 'mount.json'), state);
+  await writeFile(join(sd, 'pid'), '42');
+  await writeFile(join(cache, 'dirty'), 'pending data');
+  const exec = promisify(execFile);
+  const run = async (mountId, mounted) => {
+    const spec = { mountId, mountPath: '/mnt/data', remotePath: 'fsvol:bucket/data', readOnly: false, cacheMode: 'writes', writeBackSeconds: 5, dirCacheSeconds: 60, allowOther: true, readyTimeoutMs: 1000, stateJson: state };
+    const overrides = `fsvol_lock() { :; }\nfsvol_now() { echo 1; }\nfsvol_rclone() { echo rclone; }\nfsvol_fusermount() { echo fusermount; }\nfsvol_mounted() { return ${mounted ? 0 : 1}; }\nfsvol_mount_source() { echo fsvol:bucket/data; }\nfsvol_mount_ro() { echo 0; }\nfsvol_owned() { [ "$1" = 42 ]; }\nfsvol_pid_alive() { return 1; }\ntimeout() { return 0; }\n`;
+    const script = mountScript(paths, spec).replace('RC=$(fsvol_rclone)', `${overrides}RC=$(fsvol_rclone)`);
+    return exec('sh', ['-c', script]).then(r => ({ ...r, code: 0 }), e => e);
+  };
+  assert.match((await run(oldId, true)).stdout, /already=1/);
+  const healthy = await run(newId, true);
+  assert.equal(healthy.code, 20);
+  assert.match(healthy.stdout, /mount-identity-mismatch/);
+  const stale = await run(newId, false);
+  assert.equal(stale.code, 20);
+  assert.match(stale.stdout, /stale-state/);
+  assert.equal(await readFile(join(cache, 'dirty'), 'utf8'), 'pending data');
+  assert.equal(await readFile(join(sd, 'mount.json'), 'utf8'), state);
+});
+
+test('guest path lock rejects symlink targets and ancestors before touching state', async t => {
+  const root = await realpath(await mkdtemp(join(tmpdir(), 'fv-alias-')));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  await symlink('/etc', join(root, 'alias'));
+  const paths = { stateRoot: join(root, 's'), cacheRoot: join(root, 'c'), runRoot: join(root, 'r'), binDir: join(root, 'b') };
+  const prelude = mountScript(paths, { readyTimeoutMs: 1000, cacheMode: 'writes', stateJson: '{}', mountId: 'id', mountPath: '/mnt/data', remotePath: 'fsvol:bucket/data' }).split('RC=$(fsvol_rclone)')[0];
+  for (const path of [join(root, 'alias'), join(root, 'alias', 'missing', 'child')]) {
+    await assert.rejects(promisify(execFile)('sh', ['-c', `${prelude}\nMP=${shellQuote(path)}\nfsvol_lock`]), e => e.code === 20 && /symlink-mount-path/.test(e.stdout));
+  }
+  await assert.rejects(promisify(execFile)('sh', ['-c', `${prelude}\nhave() { return 1; }\nMP=${shellQuote(join(root, 'missing', 'child'))}\nfsvol_lock`]), e => e.code === 13 && /tool-missing flock/.test(e.stdout));
 });

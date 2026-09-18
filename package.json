@@ -24,6 +24,10 @@
     "./docker": {
       "types": "./dist/docker.d.ts",
       "import": "./dist/docker.js"
+    },
+    "./git": {
+      "types": "./dist/git.d.ts",
+      "import": "./dist/git.js"
     }
   },
   "scripts": {

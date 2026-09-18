@@ -51,10 +51,13 @@ test('mount flags reflect read-only, ownership and cache options', () => {
     '--vfs-cache-mode full --vfs-write-back 5s --dir-cache-time 60s --poll-interval 0 --vfs-cache-max-size 10G --uid 1000 --gid 1000 --umask 022 --read-only',
   );
   const script = mountScript(DEFAULT_GUEST_PATHS, { ...spec, readOnly: true });
-  assert.match(script, /--read-only/);
+  assert.match(script, /"ReadOnly":true/);
   assert.match(script, /--rc-addr 'unix:\/\/\$SOCK'/);
   assert.match(script, /setsid sh "\$SD\/run.sh"/);
-  assert.match(script, /fail_cleanup\(\) \{ rm -f/, 'failed attaches move their state aside so inspect reports absent');
+  assert.match(script, /fail_cleanup\(\) \{ :;/, 'failed attaches preserve recovery state');
+  assert.match(script, /exec '\$RC' rcd/);
+  assert.match(script, /mountType=mount/);
+  assert.match(script, /8>&-/, 'daemon must not inherit the lifecycle lock');
   assert.match(bootstrapScript(DEFAULT_GUEST_PATHS), /\/proc\/\$1\/stat/, 'liveness checks reject zombies');
   assert.throws(() => mountScript(DEFAULT_GUEST_PATHS, { ...spec, stateJson: "{'x':1}" }), VolumeError);
 });
@@ -69,6 +72,9 @@ test('parseGuestOutput reads results, errors and blocks', () => {
   assert.equal(parseVfsStats(['{"diskCache":{"uploadsQueued":2,"uploadsInProgress":1,"erroredFiles":0,"bytesUsed":99,"files":3}}']).uploadsQueued, 2);
   assert.equal(parseVfsStats(['not json']), undefined);
   assert.equal(parseVfsStats(undefined), undefined);
+  assert.equal(parseVfsStats(['{}']), undefined);
+  assert.equal(parseVfsStats(['{"diskCache":{"uploadsQueued":0,"uploadsInProgress":0}}']), undefined);
+  assert.equal(parseVfsStats(['{"diskCache":{"uploadsQueued":-1,"uploadsInProgress":0,"erroredFiles":0}}']), undefined);
 });
 
 async function mountWith(stdout, exitCode = 22) {
@@ -129,10 +135,78 @@ test('detach maps flush, busy, stale and unmanaged outcomes and returns absent i
   assert.equal(forced.pending, null);
   const flush = await run('FSVOL_ERR flush-timeout pending=3 errored=1\n', 30).catch((e) => e);
   assert.ok(flush instanceof FlushError || flush.code === 'FLUSH_FAILED');
-  assert.match(flush.message, /still attached/);
+  assert.match(flush.message, /may already be unmounted/);
   assert.equal((await run('FSVOL_ERR busy fusermount3: failed to unmount /mnt/data: Resource busy\n', 31).catch((e) => e)).code, 'MOUNT_BUSY');
   assert.equal((await run('FSVOL_ERR stale process-dead\n', 32).catch((e) => e)).code, 'MOUNT_STALE');
   assert.equal((await run('FSVOL_ERR unmanaged fsvol{x}:b/p\n', 34).catch((e) => e)).code, 'MOUNT_UNMANAGED');
+});
+
+test('RC mount options preserve units, cache mode and numeric ownership', () => {
+  const script = mountScript(DEFAULT_GUEST_PATHS, { ...spec, uid: 123, gid: 456, umask: '027', cacheMaxSize: '10G', cacheMode: 'full' });
+  const options = JSON.parse(/'vfsOpt=(\{[^\n]+\})'/.exec(script)[1]);
+  assert.deepEqual(options, { CacheMode: 3, WriteBack: '5s', DirCacheTime: '60s', PollInterval: '0s', ReadOnly: false, UID: 123, GID: 456, Umask: 23, CacheMaxSize: '10G' });
+  for (const s of [script, inspectScript(DEFAULT_GUEST_PATHS, spec.mountPath), detachScript(DEFAULT_GUEST_PATHS, { mountPath: spec.mountPath, flushTimeoutMs: 1000, force: false })]) {
+    assert.ok(s.indexOf('\nfsvol_lock\n') < s.indexOf('SD='), 'lock precedes state access');
+  }
+});
+
+function emittedOptions(overrides = {}) {
+  const script = mountScript(DEFAULT_GUEST_PATHS, { ...spec, ...overrides });
+  shellCheck(script);
+  const vfs = JSON.parse(/'vfsOpt=(\{[^\n]+\})'/.exec(script)[1]);
+  // Expand the actual run.sh heredoc, then parse its exec arguments with sh.
+  // This catches mistakes in either layer of shell quoting without starting rclone.
+  const heredoc = script.slice(script.indexOf('\n', script.indexOf(': > "$SD/stderr.log"')) + 1,
+    script.indexOf('\nFSVOL_RUN') + '\nFSVOL_RUN'.length);
+  const expanded = spawnSync('sh', ['-c', `SD=/state; RC=/rclone; CACHE=/cache; SOCK=/socket; LOG=/log; ${heredoc.replace('cat > "$SD/run.sh"', 'cat')}`], { encoding: 'utf8' });
+  assert.equal(expanded.status, 0, expanded.stderr);
+  shellCheck(expanded.stdout);
+  const exec = expanded.stdout.split('\n').find(line => line.startsWith('exec '));
+  const argv = spawnSync('sh', ['-c', `set -- ${exec.slice(5)}; printf '%s\\n' "$@"`], { encoding: 'utf8' });
+  assert.equal(argv.status, 0, argv.stderr);
+  return { script, vfs, daemon: argv.stdout.trimEnd().split('\n') };
+}
+
+test('opt-in tuning reaches actual RC fields and rcd global flags', () => {
+  const tuning = { cacheMode: 'full', bufferSize: '16777216B', readAhead: '64M', readChunkSize: '8MiB', readChunkSizeLimit: '128M', transfers: 8 };
+  const { vfs, daemon } = emittedOptions(tuning);
+  assert.deepEqual(vfs, {
+    CacheMode: 3, WriteBack: '5s', DirCacheTime: '60s', PollInterval: '0s', ReadOnly: false,
+    ReadAhead: '64M', ChunkSize: '8MiB', ChunkSizeLimit: '128M',
+  });
+  assert.deepEqual(daemon, ['/rclone', 'rcd', '--cache-dir', '/cache', '--rc-addr', 'unix:///socket',
+    '--rc-no-auth', '--log-file', '/log', '--log-level', 'INFO', '--buffer-size', '16777216B', '--transfers', '8']);
+  assert.equal(mountFlags({ ...spec, ...tuning }), '--vfs-cache-mode full --vfs-write-back 5s --dir-cache-time 60s --poll-interval 0 --buffer-size 16777216B --vfs-read-ahead 64M --vfs-read-chunk-size 8MiB --vfs-read-chunk-size-limit 128M --transfers 8 --allow-other');
+});
+
+test('omitted tuning preserves defaults; explicit zero sizes and unlimited chunks survive', () => {
+  const defaults = emittedOptions();
+  assert.deepEqual(defaults.vfs, { CacheMode: 2, WriteBack: '5s', DirCacheTime: '60s', PollInterval: '0s', ReadOnly: false });
+  assert.doesNotMatch(defaults.script, /--buffer-size|--transfers|DAEMON_FLAGS/);
+  const { vfs, daemon } = emittedOptions({ bufferSize: '0B', readAhead: '0B', readChunkSize: '0B', readChunkSizeLimit: 'off', transfers: 1 });
+  assert.equal(vfs.ReadAhead, '0B');
+  assert.equal(vfs.ChunkSize, '0B');
+  assert.equal(vfs.ChunkSizeLimit, 'off');
+  assert.deepEqual(daemon.slice(-4), ['--buffer-size', '0B', '--transfers', '1']);
+  assert.equal(emittedOptions({ transfers: 64 }).daemon.at(-1), '64');
+});
+
+test('daemon arguments survive both shell layers without interpolation', () => {
+  // Public validation will reject these sizes, but script construction must
+  // still never interpret their contents as shell commands.
+  const value = "$(printf injected)`printf injected`' $HOME; anything";
+  assert.equal(emittedOptions({ bufferSize: value }).daemon.at(-1), value);
+});
+
+test('reusing a mount reports alreadyAttached and returns before writing new tuning or state', async () => {
+  const tuned = { ...spec, cacheMode: 'full', bufferSize: '32M', transfers: 8 };
+  const script = mountScript(DEFAULT_GUEST_PATHS, tuned);
+  const reuse = script.indexOf('FSVOL_RESULT status=attached already=1 pid=$pid"; exit 0');
+  assert.ok(reuse > 0);
+  assert.ok(reuse < script.indexOf('> "$SD/mount.json"'));
+  assert.ok(reuse < script.indexOf('\nDAEMON_FLAGS='));
+  const result = await new RcloneBackend().mount(new FakeSandbox('vm-1', [{ stdout: 'FSVOL_RESULT status=attached already=1 pid=17\n' }]), tuned, {}, { timeoutMs: 1000 });
+  assert.deepEqual(result, { pid: 17, alreadyAttached: true });
 });
 
 test('exec timeouts and transport failures become SandboxError', async () => {

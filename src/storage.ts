@@ -1,4 +1,11 @@
 import {
+  AbortMultipartUploadCommand,
+  CompleteMultipartUploadCommand,
+  CreateMultipartUploadCommand,
+  CopyObjectCommand,
+  GetObjectTaggingCommand,
+  HeadObjectCommand,
+  UploadPartCopyCommand,
   DeleteObjectCommand,
   DeleteObjectsCommand,
   GetObjectCommand,
@@ -7,6 +14,7 @@ import {
   PutObjectCommand,
   S3Client,
 } from '@aws-sdk/client-s3';
+import { createHash } from 'node:crypto';
 import { StorageError, ValidationError, type StorageErrorCode } from './errors.js';
 import { assertBucket, assertEnvValue, assertInteger, assertUrl, normalizePrefix } from './validate.js';
 
@@ -33,6 +41,8 @@ export interface StorageConfig {
   provider?: string;
   /** Per-request timeout for host-side storage calls. Default 15000. */
   requestTimeoutMs?: number;
+  multipartCopyThresholdBytes?: number;
+  multipartCopyPartSizeBytes?: number;
 }
 
 export interface ResolvedStorage {
@@ -47,6 +57,8 @@ export interface ResolvedStorage {
   forcePathStyle: boolean;
   provider: string;
   requestTimeoutMs: number;
+  multipartCopyThresholdBytes: number;
+  multipartCopyPartSizeBytes: number;
 }
 
 export const DEFAULT_PREFIX = 'freestyle-volumes';
@@ -74,6 +86,8 @@ export function resolveStorage(config: StorageConfig): ResolvedStorage {
     forcePathStyle: config.forcePathStyle ?? endpoint !== undefined,
     provider,
     requestTimeoutMs: assertInteger('storage.requestTimeoutMs', config.requestTimeoutMs ?? 15000, 1000, 300000),
+    multipartCopyThresholdBytes: assertInteger('storage.multipartCopyThresholdBytes', config.multipartCopyThresholdBytes === undefined ? MAX_SINGLE_COPY_BYTES : config.multipartCopyThresholdBytes, MIN_MULTIPART_COPY_PART_BYTES, MAX_SINGLE_COPY_BYTES),
+    multipartCopyPartSizeBytes: assertInteger('storage.multipartCopyPartSizeBytes', config.multipartCopyPartSizeBytes === undefined ? DEFAULT_MULTIPART_COPY_PART_BYTES : config.multipartCopyPartSizeBytes, MIN_MULTIPART_COPY_PART_BYTES, MAX_SINGLE_COPY_BYTES),
   };
 }
 
@@ -103,43 +117,70 @@ export function rcloneRemoteEnv(storage: ResolvedStorage): Record<string, string
 export interface ObjectSummary {
   key: string;
   size: number;
+  etag?: string;
+}
+
+export const MAX_SINGLE_COPY_BYTES = 5 * 1024 ** 3;
+export const MAX_MULTIPART_COPY_BYTES = 5 * 1024 ** 4;
+export const MIN_MULTIPART_COPY_PART_BYTES = 5 * 1024 ** 2;
+export const DEFAULT_MULTIPART_COPY_PART_BYTES = 128 * 1024 ** 2;
+export const MAX_MULTIPART_COPY_PARTS = 10_000;
+export interface CopyObjectOptions {
+  /** Opaque ETag from the selected source listing, including quotes. */
+  sourceIfMatch: string;
+  size: number;
 }
 
 /** The few object-store operations the registry needs. Implemented on the AWS SDK and in memory (tests). */
 export interface ObjectStore {
+  /** Server-side copy only; must enforce sourceIfMatch and preserve bytes. */
+  copyObject?(sourceKey: string, destinationKey: string, options: CopyObjectOptions): Promise<void>;
   headBucket(): Promise<void>;
   putObject(key: string, body: string): Promise<void>;
+  /** Atomically write only if absent. False proves this call never wrote the key; never overwrite it.
+   * Ambiguous outcomes (including a retry observing its own prior write) must throw, not return false.
+   * Implementations must fail if the backend cannot enforce the condition. */
+  putObjectIfAbsent(key: string, body: string): Promise<boolean>;
   getObject(key: string): Promise<string | undefined>;
   deleteObject(key: string): Promise<void>;
   deleteObjects(keys: string[]): Promise<void>;
   listObjects(prefix: string, options?: { limit?: number }): AsyncIterable<ObjectSummary>;
 }
 
-interface ErrorLike {
-  name?: string;
-  code?: string;
-  message?: string;
-  $metadata?: { httpStatusCode?: number };
-  cause?: ErrorLike;
-}
-
 const AUTH_NAMES = new Set(['InvalidAccessKeyId', 'SignatureDoesNotMatch', 'AccessDenied', 'AuthorizationHeaderMalformed', 'InvalidToken', 'ExpiredToken', 'CredentialsProviderError']);
 const NETWORK_CODES = new Set(['ECONNREFUSED', 'ENOTFOUND', 'ETIMEDOUT', 'ECONNRESET', 'EAI_AGAIN', 'EHOSTUNREACH', 'ENETUNREACH', 'EPIPE', 'UND_ERR_CONNECT_TIMEOUT', 'ERR_TLS_CERT_ALTNAME_INVALID', 'DEPTH_ZERO_SELF_SIGNED_CERT', 'UNABLE_TO_VERIFY_LEAF_SIGNATURE']);
+const SAFE_ERROR_NAMES = new Set([...AUTH_NAMES, 'Error', 'TypeError', 'TimeoutError', 'AbortError', 'NoSuchBucket', 'NoSuchKey', 'NotFound', 'PreconditionFailed', 'ConditionalRequestConflict', 'NotImplemented', 'NoSuchUpload', 'InvalidPart', 'InvalidPartOrder', 'EntityTooSmall', 'EntityTooLarge', 'InvalidRequest', 'InvalidArgument', 'InvalidTag', 'InternalError', 'ServiceUnavailable', 'SlowDown', 'RequestTimeout', 'StorageError']);
+const STORAGE_CODES = new Set<StorageErrorCode>(['STORAGE_AUTH', 'STORAGE_UNREACHABLE', 'BUCKET_NOT_FOUND', 'STORAGE_ERROR']);
+
+function errorField(value: unknown, key: string): unknown {
+  if ((typeof value !== 'object' && typeof value !== 'function') || value === null) return undefined;
+  try {
+    return Object.getOwnPropertyDescriptor(value, key)?.value;
+  } catch {
+    return undefined;
+  }
+}
+
+function safeErrorName(value: unknown): string {
+  return typeof value === 'string' && SAFE_ERROR_NAMES.has(value) ? value : 'Error';
+}
 
 function isNotFound(error: unknown): boolean {
-  const e = error as ErrorLike;
-  return e?.name === 'NoSuchKey' || e?.name === 'NotFound' || e?.$metadata?.httpStatusCode === 404;
+  const name = errorField(error, 'name');
+  return name === 'NoSuchKey' || name === 'NotFound' || errorField(errorField(error, '$metadata'), 'httpStatusCode') === 404;
 }
 
 /** Map an AWS SDK / network failure to a {@link StorageError} without leaking credentials. */
 export function toStorageError(error: unknown, operation: string, bucket: string): StorageError {
-  const e = (error ?? {}) as ErrorLike;
-  const name = e.name ?? 'Error';
-  const status = e.$metadata?.httpStatusCode;
-  const code = e.code ?? e.cause?.code;
-  const message = typeof e.message === 'string' ? e.message : String(error);
-  let kind: StorageErrorCode = 'STORAGE_ERROR';
-  let hint = 'Inspect `cause` for the underlying error.';
+  const name = safeErrorName(errorField(error, 'name'));
+  const rawStatus = errorField(errorField(error, '$metadata'), 'httpStatusCode');
+  const status = typeof rawStatus === 'number' && Number.isInteger(rawStatus) && rawStatus >= 100 && rawStatus <= 599 ? rawStatus : undefined;
+  const rawCode = errorField(error, 'code');
+  const causeCode = errorField(errorField(error, 'cause'), 'code');
+  const code = typeof rawCode === 'string' && NETWORK_CODES.has(rawCode) ? rawCode
+    : typeof causeCode === 'string' && NETWORK_CODES.has(causeCode) ? causeCode : undefined;
+  let kind: StorageErrorCode = typeof rawCode === 'string' && STORAGE_CODES.has(rawCode as StorageErrorCode) ? rawCode as StorageErrorCode : 'STORAGE_ERROR';
+  let hint = 'Inspect the safe error classification and provider-side logs; raw provider diagnostics are omitted.';
   if (AUTH_NAMES.has(name) || status === 403 || status === 401) {
     kind = 'STORAGE_AUTH';
     hint = 'Check accessKeyId, secretAccessKey, sessionToken and the bucket policy for this key.';
@@ -150,8 +191,8 @@ export function toStorageError(error: unknown, operation: string, bucket: string
     kind = 'STORAGE_UNREACHABLE';
     hint = 'Check the endpoint URL, DNS, TLS and network access from this process.';
   }
-  return new StorageError(kind, `Storage ${operation} failed for bucket "${bucket}": ${name}${status ? ` (HTTP ${status})` : ''}${code ? ` [${code}]` : ''}: ${message}`, {
-    cause: error,
+  return new StorageError(kind, `Storage ${operation} failed for bucket "${bucket}": ${name}${status ? ` (HTTP ${status})` : ''}${code ? ` [${code}]` : ''}.`, {
+    cause: { name, ...(code === undefined ? {} : { code }), ...(status === undefined ? {} : { $metadata: { httpStatusCode: status } }) },
     hint,
     details: { operation, bucket, status, name, code },
   });
@@ -161,10 +202,14 @@ export class S3ObjectStore implements ObjectStore {
   readonly bucket: string;
   private readonly client: S3Client;
   private readonly timeoutMs: number;
+  private readonly multipartCopyThresholdBytes: number;
+  private readonly multipartCopyPartSizeBytes: number;
 
   constructor(storage: ResolvedStorage, client?: S3Client) {
     this.bucket = storage.bucket;
     this.timeoutMs = storage.requestTimeoutMs;
+    this.multipartCopyThresholdBytes = storage.multipartCopyThresholdBytes;
+    this.multipartCopyPartSizeBytes = storage.multipartCopyPartSizeBytes;
     this.client =
       client ??
       new S3Client({
@@ -183,6 +228,114 @@ export class S3ObjectStore implements ObjectStore {
     return AbortSignal.timeout(this.timeoutMs);
   }
 
+  async copyObject(sourceKey: string, destinationKey: string, options: CopyObjectOptions): Promise<void> {
+    validateCopy(options);
+    const encode = (part: string) => encodeURIComponent(part).replace(/[!'()*]/g, (c) => `%${c.charCodeAt(0).toString(16).toUpperCase()}`);
+    let uploadId: string | undefined;
+    let stage = 'head';
+    let completionStatus: 'not-attempted' | 'unknown' = 'not-attempted';
+    let validationFailure: StorageError | undefined;
+    const invalidResponse = (message: string) => {
+      validationFailure = new StorageError('STORAGE_ERROR', message);
+      return validationFailure;
+    };
+    try {
+      const head = await this.client.send(new HeadObjectCommand({
+        Bucket: this.bucket, Key: sourceKey, IfMatch: options.sourceIfMatch,
+      }), { abortSignal: this.signal() });
+      if (head.ContentLength !== options.size || head.ETag !== options.sourceIfMatch) {
+        throw invalidResponse('Copy source size or ETag changed since selection.');
+      }
+      const version = head.VersionId === undefined ? {} : { VersionId: head.VersionId };
+      const copySource = [this.bucket, ...sourceKey.split('/')].map(encode).join('/') +
+        (head.VersionId === undefined ? '' : `?versionId=${encode(head.VersionId)}`);
+      if (options.size <= this.multipartCopyThresholdBytes) {
+        stage = 'copy';
+        const copied = await this.client.send(new CopyObjectCommand({
+          Bucket: this.bucket, Key: destinationKey, CopySource: copySource,
+          CopySourceIfMatch: options.sourceIfMatch,
+        }), { abortSignal: this.signal() });
+        completionStatus = 'unknown';
+        if (!validEtag(copied?.CopyObjectResult?.ETag)) {
+          throw invalidResponse('Copy returned no valid completion ETag; the destination may exist.');
+        }
+        return;
+      }
+      stage = 'tags';
+      const tags = await this.client.send(new GetObjectTaggingCommand({
+        Bucket: this.bucket, Key: sourceKey, ...version,
+      }), { abortSignal: this.signal() });
+      const tagging = (tags.TagSet ?? []).map(tag => {
+        if (typeof tag.Key !== 'string' || typeof tag.Value !== 'string') {
+          throw invalidResponse('Copy source returned an invalid tag.');
+        }
+        return `${encode(tag.Key)}=${encode(tag.Value)}`;
+      }).join('&');
+      stage = 'create';
+      const created = await this.client.send(new CreateMultipartUploadCommand({
+        Bucket: this.bucket, Key: destinationKey,
+        ContentType: head.ContentType, ContentEncoding: head.ContentEncoding,
+        ContentLanguage: head.ContentLanguage, ContentDisposition: head.ContentDisposition,
+        CacheControl: head.CacheControl, Expires: head.Expires, Metadata: head.Metadata,
+        ...(tagging ? { Tagging: tagging } : {}),
+      }), { abortSignal: this.signal() });
+      if (typeof created.UploadId !== 'string' || !created.UploadId.trim()) {
+        throw invalidResponse('Multipart creation returned no UploadId; an upload may exist and requires reconciliation.');
+      }
+      uploadId = created.UploadId;
+      const destination = { Bucket: this.bucket, Key: destinationKey, UploadId: uploadId };
+      const partSize = Math.max(this.multipartCopyPartSizeBytes, Math.ceil(options.size / MAX_MULTIPART_COPY_PARTS));
+      const parts: { PartNumber: number; ETag: string }[] = [];
+      stage = 'part';
+      for (let start = 0; start < options.size; start += partSize) {
+        const partNumber = parts.length + 1;
+        const part = await this.client.send(new UploadPartCopyCommand({
+          ...destination, PartNumber: partNumber, CopySource: copySource,
+          CopySourceIfMatch: options.sourceIfMatch,
+          CopySourceRange: `bytes=${start}-${Math.min(start + partSize, options.size) - 1}`,
+        }), { abortSignal: this.signal() });
+        const etag = part?.CopyPartResult?.ETag;
+        if (!validEtag(etag)) {
+          throw invalidResponse('Multipart copy returned no valid part ETag.');
+        }
+        parts.push({ PartNumber: partNumber, ETag: etag });
+      }
+      stage = 'complete';
+      completionStatus = 'unknown';
+      const completed = await this.client.send(new CompleteMultipartUploadCommand({
+        ...destination, MultipartUpload: { Parts: parts },
+      }), { abortSignal: this.signal() });
+      if (!validEtag(completed?.ETag)) {
+        throw invalidResponse('Multipart copy returned no valid completion ETag; the destination may exist.');
+      }
+    } catch (error) {
+      let abortStatus: 'not-attempted' | 'acknowledged' | 'failed' = 'not-attempted';
+      let abortError: StorageError | undefined;
+      if (uploadId !== undefined) {
+        try {
+          await this.client.send(new AbortMultipartUploadCommand({
+            Bucket: this.bucket, Key: destinationKey, UploadId: uploadId,
+          }), { abortSignal: this.signal() });
+          abortStatus = 'acknowledged';
+        } catch (failure) {
+          abortStatus = 'failed';
+          abortError = toStorageError(failure, 'abortMultipartCopy', this.bucket);
+        }
+      }
+      const failure = validationFailure !== undefined && error === validationFailure ? validationFailure : toStorageError(error, 'copy', this.bucket);
+      throw new StorageError(failure.code as StorageErrorCode, 'Server-side copy failed.', {
+        cause: failure,
+        hint: completionStatus === 'unknown'
+          ? 'Completion may have succeeded. Retain destination data and reconcile; an abort response does not prove the destination is absent.'
+          : stage === 'create' || uploadId !== undefined
+            ? 'Reconcile unfinished uploads; abort acknowledgment alone does not prove all remote work stopped.'
+            : 'Inspect cause for the source validation or provider failure.',
+        details: { operation: 'copy', bucket: this.bucket, destinationKey, stage, uploadId, completionStatus, abortStatus,
+          ...(abortError === undefined ? {} : { abortError }) },
+      });
+    }
+  }
+
   async headBucket(): Promise<void> {
     try {
       await this.client.send(new HeadBucketCommand({ Bucket: this.bucket }), { abortSignal: this.signal() });
@@ -196,6 +349,29 @@ export class S3ObjectStore implements ObjectStore {
       await this.client.send(new PutObjectCommand({ Bucket: this.bucket, Key: key, Body: body, ContentType: 'application/json' }), { abortSignal: this.signal() });
     } catch (error) {
       throw toStorageError(error, 'put', this.bucket);
+    }
+  }
+
+  async putObjectIfAbsent(key: string, body: string): Promise<boolean> {
+    let attempts = 0;
+    const command = new PutObjectCommand({ Bucket: this.bucket, Key: key, Body: body, ContentType: 'application/json', IfNoneMatch: '*' });
+    // A retry may observe our own successful first write. Such a 412 is not
+    // proof that this operation never published, so callers must retain data.
+    command.middlewareStack.add((next) => async (args) => {
+      attempts += 1;
+      return next(args);
+    }, { step: 'finalizeRequest', priority: 'low', name: 'countConditionalAttempts' });
+    try {
+      await this.client.send(
+        command,
+        { abortSignal: this.signal() },
+      );
+      return true;
+    } catch (error) {
+      if (attempts <= 1 && (errorField(errorField(error, '$metadata'), 'httpStatusCode') === 412 || errorField(error, 'name') === 'PreconditionFailed')) return false;
+      // Conflicts (409), unsupported conditions and ambiguous failures are not
+      // proof of an existing record. Surface them; never fall back to a plain PUT.
+      throw toStorageError(error, 'putIfAbsent', this.bucket);
     }
   }
 
@@ -219,20 +395,21 @@ export class S3ObjectStore implements ObjectStore {
 
   async deleteObjects(keys: string[]): Promise<void> {
     if (keys.length === 0) return;
+    let response;
     try {
-      const response = await this.client.send(
+      response = await this.client.send(
         new DeleteObjectsCommand({ Bucket: this.bucket, Delete: { Objects: keys.map((Key) => ({ Key })), Quiet: true } }),
         { abortSignal: this.signal() },
       );
-      const failed = response.Errors ?? [];
-      if (failed.length > 0) {
-        throw new StorageError('STORAGE_ERROR', `Storage delete failed for ${failed.length} of ${keys.length} objects in bucket "${this.bucket}": ${failed[0]?.Code ?? 'unknown'}: ${failed[0]?.Message ?? ''}`, {
-          details: { failed: failed.map((f) => ({ key: f.Key, code: f.Code })) },
-        });
-      }
     } catch (error) {
-      if (error instanceof StorageError) throw error;
       throw toStorageError(error, 'deleteObjects', this.bucket);
+    }
+    const failed = response.Errors ?? [];
+    if (failed.length > 0) {
+      const requested = new Set(keys);
+      throw new StorageError('STORAGE_ERROR', `Storage delete failed for ${failed.length} of ${keys.length} objects in bucket "${this.bucket}".`, {
+        details: { failed: failed.map((f) => ({ key: typeof f.Key === 'string' && requested.has(f.Key) ? f.Key : undefined, code: safeErrorName(f.Code) })) },
+      });
     }
   }
 
@@ -252,7 +429,7 @@ export class S3ObjectStore implements ObjectStore {
       for (const object of page.Contents ?? []) {
         if (remaining <= 0) return;
         if (object.Key !== undefined) {
-          yield { key: object.Key, size: object.Size ?? 0 };
+          yield { key: object.Key, size: object.Size ?? 0, ...(object.ETag === undefined ? {} : { etag: object.ETag }) };
           remaining -= 1;
         }
       }
@@ -269,7 +446,6 @@ export class MemoryObjectStore implements ObjectStore {
 
   private check(operation: string): void {
     if (this.failWith === undefined) return;
-    if (this.failWith instanceof StorageError) throw this.failWith;
     throw toStorageError(this.failWith, operation, 'memory');
   }
 
@@ -277,9 +453,26 @@ export class MemoryObjectStore implements ObjectStore {
     this.check('headBucket');
   }
 
+  async copyObject(sourceKey: string, destinationKey: string, options: CopyObjectOptions): Promise<void> {
+    this.check('copy');
+    validateCopy(options);
+    const body = this.objects.get(sourceKey);
+    if (body === undefined || memoryEtag(body) !== options.sourceIfMatch || Buffer.byteLength(body) !== options.size) {
+      throw new StorageError('STORAGE_ERROR', 'Copy source is missing or changed.');
+    }
+    this.objects.set(destinationKey, body);
+  }
+
   async putObject(key: string, body: string): Promise<void> {
     this.check('put');
     this.objects.set(key, body);
+  }
+
+  async putObjectIfAbsent(key: string, body: string): Promise<boolean> {
+    this.check('putIfAbsent');
+    if (this.objects.has(key)) return false;
+    this.objects.set(key, body);
+    return true;
   }
 
   async getObject(key: string): Promise<string | undefined> {
@@ -303,9 +496,24 @@ export class MemoryObjectStore implements ObjectStore {
     for (const key of [...this.objects.keys()].sort()) {
       if (remaining <= 0) return;
       if (key.startsWith(prefix)) {
-        yield { key, size: this.objects.get(key)?.length ?? 0 };
+        const body = this.objects.get(key);
+        if (body === undefined) continue;
+        yield { key, size: Buffer.byteLength(body), etag: memoryEtag(body) };
         remaining -= 1;
       }
     }
   }
+}
+
+function memoryEtag(body: string): string {
+  return `"${createHash('sha256').update(body).digest('hex')}"`;
+}
+
+function validEtag(value: unknown): value is string {
+  return typeof value === 'string' && value.trim().length > 0;
+}
+
+function validateCopy(options: CopyObjectOptions): void {
+  assertInteger('copy size', options.size, 0, MAX_MULTIPART_COPY_BYTES);
+  if (typeof options.sourceIfMatch !== 'string' || !options.sourceIfMatch) throw new ValidationError('Copy requires a source ETag.');
 }

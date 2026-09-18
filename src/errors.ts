@@ -110,7 +110,7 @@ export class MountError extends VolumeError {
   }
 }
 
-/** Thrown by detach when pending writes could not be made durable. The mount is left in place. */
+/** Thrown when detach cannot prove a durable drain. The mount may already be removed; recoverable cache and advisory records are retained. */
 export class FlushError extends VolumeError {
   constructor(message: string, options: VolumeErrorOptions = {}) {
     super('FLUSH_FAILED', message, options);

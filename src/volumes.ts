@@ -7,10 +7,10 @@
  */
 import { VolumeError } from './errors.js';
 import { DEFAULT_GUEST_PATHS, RcloneBackend, type CacheMode, type MountSpec } from './rclone.js';
-import { VolumeRegistry, type AttachmentRecord, type Volume } from './registry.js';
+import { VolumeRegistry, type AttachmentRecord, type Volume, type CloneVolumeOptions, type CloneResult, type ListVolumesOptions } from './registry.js';
 import type { SandboxResolver } from './sandbox.js';
 import { RCLONE_REMOTE, S3ObjectStore, rcloneRemoteEnv, resolveStorage, type ObjectStore, type ResolvedStorage, type StorageConfig } from './storage.js';
-import { assertCacheSize, assertInteger, assertMountPath, assertSandboxId, assertSubpath, assertUmask, assertVolumeName, mountIdFor } from './validate.js';
+import { assertCacheSize, assertInteger, assertMountPath, assertRcloneSize, assertSandboxId, assertSubpath, assertUmask, assertVolumeName, mountIdFor } from './validate.js';
 
 export interface MountDefaults {
   /** rclone VFS cache mode. `writes` buffers writes on the sandbox disk; `full` also caches reads. */
@@ -28,6 +28,16 @@ export interface MountDefaults {
   umask?: string;
   /** Cap for the on-disk write cache, e.g. "10G". Unbounded by default. */
   cacheMaxSize?: string;
+  /** Per-open-file memory buffer, e.g. "16M" or "0B". Explicit units required; omitted uses rclone's default. */
+  bufferSize?: string;
+  /** Extra disk read-ahead, effective only with cacheMode: "full"; does not change cacheMode. Explicit units required. */
+  readAhead?: string;
+  /** Initial ranged-read chunk size, e.g. "128M". Explicit units required; omitted uses rclone's default. */
+  readChunkSize?: string;
+  /** Maximum ranged-read chunk size with explicit units, or "off" for no limit. Omitted uses rclone's default. */
+  readChunkSizeLimit?: string;
+  /** Daemon-wide concurrent file transfers, integer 1–64. Omitted uses rclone's default. */
+  transfers?: number;
   /** How long attach waits for the FUSE mount to answer a directory listing. */
   readyTimeoutMs: number;
   /** How long detach waits for pending uploads to finish. */
@@ -150,9 +160,9 @@ export interface DetachResult {
   sandboxId: string;
   mountPath: string;
   volumeId: string | null;
-  /** True only when every pending upload completed before the mount was removed. */
+  /** True only when the mount was removed and its pending uploads then fully drained. */
   flushed: boolean;
-  /** Uploads still pending when a forced detach dropped the mount; null when unknown. */
+  /** Uploads still pending after the drain attempt; null when unknown. */
   pendingUploads: number | null;
   warnings: string[];
 }
@@ -211,8 +221,15 @@ export class FreestyleVolumes {
     return this.registry.get(name);
   }
 
-  async list(): Promise<Volume[]> {
-    return this.registry.list();
+  /** Server-side, object-wise consistent clone. Advisory attachment checks do not provide snapshot isolation. */
+  async clone(options: CloneVolumeOptions): Promise<CloneResult> {
+    const result = await this.registry.clone(options);
+    this.emit({ type: 'volume.created', volumeId: result.volume.id });
+    return result;
+  }
+
+  async list(options: ListVolumesOptions = {}): Promise<Volume[]> {
+    return this.registry.list(options);
   }
 
   /** Destroys the volume record and every object under its data prefix. Requires `confirm === volumeId`. */
@@ -228,9 +245,9 @@ export class FreestyleVolumes {
 
   /**
    * Mount a volume into a sandbox. Idempotent: a healthy mount of the same
-   * volume at the same path is reported with `alreadyAttached: true`; a stale
-   * one is cleaned up and remounted, resuming any pending uploads from the
-   * sandbox cache.
+   * storage identity, volume and read-only mode at the same path is reported with
+   * `alreadyAttached: true`. Stale mounts require detach before retrying;
+   * retained cache is reused only for the same storage and mount identity.
    */
   async attach(options: AttachVolumeOptions): Promise<VolumeAttachment> {
     const sandboxId = assertSandboxId(options.sandboxId);
@@ -239,10 +256,9 @@ export class FreestyleVolumes {
     const subpath = options.subpath === undefined ? undefined : assertSubpath(options.subpath);
     const readOnly = options.readOnly === true;
     const settings = validateDefaults({ ...this.defaults, ...stripUndefined(options) });
-    const mountId = mountIdFor(volumeId, subpath, mountPath);
-
     const volume = await this.registry.get(volumeId);
-    const dataPrefix = this.registry.dataPrefix(volume.id, subpath);
+    const mountId = mountIdFor(volumeId, subpath, mountPath, this.storage, volume.generation);
+    const dataPrefix = subpath ? `${volume.dataPrefix}/${subpath}` : volume.dataPrefix;
     await this.registry.precheck(dataPrefix);
 
     const sandbox = await this.sandboxes.get(sandboxId);
@@ -263,6 +279,7 @@ export class FreestyleVolumes {
         version: 1,
         mountId,
         volumeId: volume.id,
+        generation: volume.generation,
         subpath: subpath ?? null,
         mountPath,
         readOnly,
@@ -275,6 +292,11 @@ export class FreestyleVolumes {
     if (settings.gid !== undefined) spec.gid = settings.gid;
     if (settings.umask !== undefined) spec.umask = settings.umask;
     if (settings.cacheMaxSize !== undefined) spec.cacheMaxSize = settings.cacheMaxSize;
+    if (settings.bufferSize !== undefined) spec.bufferSize = settings.bufferSize;
+    if (settings.readAhead !== undefined) spec.readAhead = settings.readAhead;
+    if (settings.readChunkSize !== undefined) spec.readChunkSize = settings.readChunkSize;
+    if (settings.readChunkSizeLimit !== undefined) spec.readChunkSizeLimit = settings.readChunkSizeLimit;
+    if (settings.transfers !== undefined) spec.transfers = settings.transfers;
 
     this.emit({ type: 'attach.mount', sandboxId, volumeId, mountPath });
     const mounted = await this.backend.mount(sandbox, spec, rcloneRemoteEnv(this.storage), { timeoutMs: Math.min(settings.readyTimeoutMs + 30_000, MAX_EXEC_MS) });
@@ -318,9 +340,11 @@ export class FreestyleVolumes {
   }
 
   /**
-   * Flush pending writes, unmount, and stop the filesystem process. Succeeds
-   * only when every pending upload completed (`flushed: true`), unless
-   * `force` is set. Never deletes volume data.
+   * Unmount first to stop new writes, drain pending uploads, then stop the
+   * filesystem process. Succeeds only after a verified drain (`flushed: true`),
+   * unless `force` is set. An unflushed detach retains the advisory attachment
+   * record to guard deletion while recoverable data remains in the sandbox.
+   * Never deletes volume data.
    */
   async detach(options: DetachVolumeOptions): Promise<DetachResult> {
     const sandboxId = assertSandboxId(options.sandboxId);
@@ -331,7 +355,7 @@ export class FreestyleVolumes {
     this.emit({ type: 'detach.start', sandboxId, mountPath });
     const guest = await this.backend.unmount(sandbox, { mountPath, flushTimeoutMs, force, timeoutMs: flushTimeoutMs + 40_000 });
     const warnings: string[] = [];
-    if (guest.status === 'detached' && guest.volumeId && guest.mountId) {
+    if (guest.status === 'detached' && guest.flushed && guest.volumeId && guest.mountId) {
       try {
         await this.registry.removeAttachment(guest.volumeId, sandboxId, guest.mountId);
       } catch (error) {
@@ -379,8 +403,14 @@ function validateDefaults(input: MountDefaults & Record<string, unknown>): Mount
   if (input.gid !== undefined) out.gid = assertInteger('gid', input.gid, 0, 4_294_967_294);
   if (input.umask !== undefined) out.umask = assertUmask(input.umask);
   if (input.cacheMaxSize !== undefined) out.cacheMaxSize = assertCacheSize(input.cacheMaxSize);
+  if (input.bufferSize !== undefined) out.bufferSize = assertRcloneSize('bufferSize', input.bufferSize);
+  if (input.readAhead !== undefined) out.readAhead = assertRcloneSize('readAhead', input.readAhead);
+  if (input.readChunkSize !== undefined) out.readChunkSize = assertRcloneSize('readChunkSize', input.readChunkSize);
+  if (input.readChunkSizeLimit !== undefined) out.readChunkSizeLimit = assertRcloneSize('readChunkSizeLimit', input.readChunkSizeLimit, true);
+  if (input.transfers !== undefined) out.transfers = assertInteger('transfers', input.transfers, 1, 64);
   return out;
 }
 
 export { DEFAULT_GUEST_PATHS };
 export type { Volume, AttachmentRecord };
+export type { CloneVolumeOptions, CloneResult, ListVolumesOptions };

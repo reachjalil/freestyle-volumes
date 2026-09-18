@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { assertVolumeName, assertMountPath, assertSubpath, assertSandboxId, assertBucket, normalizePrefix, shellQuote, mountIdFor, PROTECTED_MOUNT_ROOTS, ValidationError } from '../../dist/index.js';
+import { assertVolumeName, assertMountPath, assertSubpath, assertSandboxId, assertBucket, normalizePrefix, shellQuote, mountIdFor, resolveStorage, PROTECTED_MOUNT_ROOTS, ValidationError } from '../../dist/index.js';
 
 test('volume names are DNS-label style', () => {
   for (const ok of ['a', 'data', 'my-volume-01', 'x'.repeat(63)]) assert.equal(assertVolumeName(ok), ok);
@@ -48,4 +48,16 @@ test('mount ids are stable and distinct per volume, subpath and path', () => {
   assert.notEqual(a, mountIdFor('vol2', undefined, '/mnt/a'));
   assert.notEqual(a, mountIdFor('vol', 'sub', '/mnt/a'));
   assert.notEqual(a, mountIdFor('vol', undefined, '/mnt/b'));
+});
+
+test('mount ids include resolved storage identity but exclude credentials and timeouts', () => {
+  const storage = resolveStorage({ endpoint: 'https://one.example', bucket: 'bucket', accessKeyId: 'key', secretAccessKey: 'secret' });
+  const id = value => mountIdFor('vol', undefined, '/mnt/data', value);
+  const original = id(storage);
+  assert.notEqual(original, mountIdFor('vol', undefined, '/mnt/data'), 'legacy cache is not rebound');
+  for (const [key, value] of Object.entries({ endpoint: 'https://two.example', sandboxEndpoint: 'https://guest.example', bucket: 'other-bucket', prefix: 'other', region: 'eu-west-1', provider: 'Minio', forcePathStyle: false })) {
+    assert.notEqual(original, id({ ...storage, [key]: value }), key);
+  }
+  assert.equal(original, id({ ...storage, accessKeyId: 'rotated', secretAccessKey: 'rotated-secret', sessionToken: 'token', requestTimeoutMs: 20000 }));
+  assert.equal(original, id(resolveStorage({ ...storage, sandboxEndpoint: undefined })), 'default endpoint resolves identically');
 });

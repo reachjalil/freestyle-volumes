@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto';
 import { ValidationError } from './errors.js';
+import type { ResolvedStorage } from './storage.js';
 
 /** Volume ids double as names: DNS-label style, 1-63 chars. */
 const VOLUME_NAME = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
@@ -123,6 +124,20 @@ export function assertCacheSize(value: unknown): string {
   return value;
 }
 
+/** rclone sizes with explicit units; bare numbers otherwise mean KiB, not bytes. */
+export function assertRcloneSize(name: string, value: unknown, allowOff = false): string {
+  if (allowOff && value === 'off') return value;
+  const match = typeof value === 'string' && value.length <= 64
+    ? /^([0-9]+(?:\.[0-9]+)?)(B|[KMGTPE](?:i?B)?)$/i.exec(value)
+    : null;
+  if (match && match[0] === value) {
+    const unit = match[2]![0]!.toUpperCase();
+    const bytes = Number(match[1]) * 1024 ** 'BKMGTPE'.indexOf(unit);
+    if (Number.isFinite(bytes) && bytes < 2 ** 63) return value as string;
+  }
+  throw new ValidationError(`${name} must be a nonnegative size with explicit units, e.g. "0B", "512K", "16M" or "1GiB"${allowOff ? ', or "off"' : ''}, below 8 EiB.`);
+}
+
 export function assertUmask(value: unknown): string {
   if (typeof value !== 'string' || !UMASK.test(value)) {
     throw new ValidationError(`umask ${JSON.stringify(value)} must be three octal digits, e.g. "022".`);
@@ -136,7 +151,14 @@ export function shellQuote(value: string): string {
   return `'${value.replace(/'/g, `'\\''`)}'`;
 }
 
-/** Stable identifier for one (volume, subpath, mountPath) triple inside a sandbox. */
-export function mountIdFor(volumeId: string, subpath: string | undefined, mountPath: string): string {
-  return createHash('sha256').update(`${volumeId}\0${subpath ?? ''}\0${mountPath}`).digest('hex').slice(0, 16);
+/** Stable mount/cache identity. Omit storage only for legacy three-argument callers; pass generation for v2 volumes. */
+export function mountIdFor(volumeId: string, subpath: string | undefined, mountPath: string, storage?: Pick<ResolvedStorage, 'endpoint' | 'sandboxEndpoint' | 'bucket' | 'prefix' | 'region' | 'provider' | 'forcePathStyle'>, generation?: string): string {
+  // Explicit allowlist: credential rotation and request timeouts must not change
+  // cache identity. Never serialize the full resolved storage configuration.
+  const identity = storage === undefined ? `${volumeId}\0${subpath ?? ''}\0${mountPath}` : JSON.stringify([
+    'storage-v1', storage.endpoint ?? null, storage.sandboxEndpoint ?? null,
+    storage.bucket, storage.prefix, storage.region, storage.provider, storage.forcePathStyle,
+    volumeId, subpath ?? '', mountPath,
+  ]);
+  return createHash('sha256').update(generation === undefined ? identity : `${identity}\0generation:${generation}`).digest('hex').slice(0, 16);
 }

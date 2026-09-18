@@ -54,6 +54,16 @@ export interface MountSpec {
   gid?: number;
   umask?: string;
   cacheMaxSize?: string;
+  /** rclone SizeSuffix (e.g. "16M" or "16777216B"); per-open-file memory buffer. */
+  bufferSize?: string;
+  /** Extra disk read-ahead in full cache mode; rclone SizeSuffix. */
+  readAhead?: string;
+  /** Initial sequential read chunk size; rclone SizeSuffix. */
+  readChunkSize?: string;
+  /** Sequential chunk growth limit; rclone SizeSuffix, or "off" for unlimited. */
+  readChunkSizeLimit?: string;
+  /** Daemon-wide concurrent file transfers; public validation must enforce integer 1..64. */
+  transfers?: number;
   readyTimeoutMs: number;
   /** JSON document stored as mount.json in the sandbox. Must not contain single quotes. */
   stateJson: string;
@@ -112,6 +122,9 @@ export function parseVfsStats(lines: string[] | undefined): RcloneVfsStats | und
   try {
     const parsed = JSON.parse(lines.join('\n')) as { diskCache?: Record<string, unknown> };
     const cache = parsed.diskCache ?? {};
+    for (const key of ['uploadsQueued', 'uploadsInProgress', 'erroredFiles']) {
+      if (typeof cache[key] !== 'number' || !Number.isSafeInteger(cache[key]) || (cache[key] as number) < 0) return undefined;
+    }
     const num = (key: string) => (typeof cache[key] === 'number' ? (cache[key] as number) : 0);
     return { uploadsQueued: num('uploadsQueued'), uploadsInProgress: num('uploadsInProgress'), erroredFiles: num('erroredFiles'), cacheBytes: num('bytesUsed'), cachedFiles: num('files') };
   } catch {
@@ -128,6 +141,7 @@ export interface RuntimeInfo {
 
 export interface GuestMountResult {
   pid: number;
+  /** Reused mounts retain their existing options; requested tuning was not applied. */
   alreadyAttached: boolean;
 }
 
@@ -165,14 +179,43 @@ RUN_ROOT=${q(paths.runRoot)}
 CACHE_ROOT=${q(paths.cacheRoot)}
 BIN_DIR=${q(paths.binDir)}
 have() { command -v "$1" >/dev/null 2>&1; }
+# BusyBox timeout's watchdog can outlive its command. Only the lifecycle
+# shell may retain the lock; neither the command nor its watchdog needs it.
+timeout() { command timeout "$@" 8>&-; }
 fsvol_rclone() { if [ -x "$BIN_DIR/rclone" ]; then echo "$BIN_DIR/rclone"; elif have rclone; then command -v rclone; else return 1; fi; }
 fsvol_fusermount() { if have fusermount3; then command -v fusermount3; elif have fusermount; then command -v fusermount; else return 1; fi; }
-fsvol_mounted() { grep -q " $1 fuse.rclone " /proc/mounts 2>/dev/null; }
+fsvol_mounted() { awk -v m="$1" '$2 == m && $3 == "fuse.rclone" { found=1 } END { exit !found }' /proc/mounts; }
 fsvol_mount_source() { awk -v m="$1" '$2 == m && $3 == "fuse.rclone" { s = $1 } END { print s }' /proc/mounts; }
 fsvol_mount_ro() { awk -v m="$1" '$2 == m && $3 == "fuse.rclone" { o = $4 } END { if (o ~ /^ro(,|$)/) print 1; else print 0 }' /proc/mounts; }
 fsvol_log_tail() { if [ -f "$1" ]; then echo FSVOL_LOG_BEGIN; tail -n 25 "$1"; echo FSVOL_LOG_END; fi; }
 fsvol_find_state() { d=""; for f in "$STATE_ROOT"/mounts/*/mount.json; do [ -f "$f" ] || continue; if grep -q -F "\\"mountPath\\":\\"$1\\"" "$f"; then d=$(dirname "$f"); fi; done; echo "$d"; }
-fsvol_pid_alive() { [ -n "$1" ] || return 1; kill -0 "$1" 2>/dev/null || return 1; st=$(sed 's/.*) //' "/proc/$1/stat" 2>/dev/null | cut -d" " -f1); [ "$st" != "Z" ]; }
+fsvol_pid_alive() { case "$1" in ''|*[!0-9]*|0|1) return 1;; esac; kill -0 "$1" 2>/dev/null || return 1; st=$(sed 's/.*) //' "/proc/$1/stat" 2>/dev/null | cut -d" " -f1); [ -n "$st" ] && [ "$st" != "Z" ]; }
+fsvol_start() { sed 's/.*) //' "/proc/$1/stat" 2>/dev/null | cut -d' ' -f20; }
+# The start time survives exec and distinguishes a reused PID. Fail closed for
+# legacy state without an identity record; never signal a process by PID alone.
+fsvol_owned() {
+  fsvol_pid_alive "$1" || return 1
+  [ -s "$SD/pid.start" ] && [ "$(cat "$SD/pid.start")" = "$(fsvol_start "$1")" ] || return 1
+  [ -s "$SD/pid.exe" ] && [ "$(cat "$SD/pid.exe")" = "$(readlink "/proc/$1/exe")" ] || return 1
+  tr '\\000' '\\n' < "/proc/$1/cmdline" | grep -F -x -- "unix://$SOCK" >/dev/null || return 1
+}
+# Lock the path (not the volume ID): competing mounts of different volumes at
+# one path must serialize too. Persistent lock files must never be unlinked.
+fsvol_lock() {
+  # Reject symlink aliases before locking or touching state: lexical path
+  # validation alone cannot protect OS directories or serialize alias paths.
+  p="$MP"
+  while [ "$p" != / ]; do
+    [ ! -L "$p" ] || { echo 'FSVOL_ERR path-in-use symlink-mount-path'; exit 20; }
+    p=\${p%/*}; [ -n "$p" ] || p=/
+  done
+  have flock || { echo 'FSVOL_ERR tool-missing flock'; exit 13; }
+  mkdir -p "$STATE_ROOT/locks" || exit 11
+  lk=$(printf '%s' "$MP" | sha256sum); lk=\${lk%% *}
+  exec 8>"$STATE_ROOT/locks/$lk.lock"
+  flock -n 8 || { echo 'FSVOL_ERR lifecycle-busy'; exit 36; }
+}
+fsvol_now() { cut -d. -f1 /proc/uptime; }
 `;
 }
 
@@ -193,8 +236,9 @@ if have flock; then n=0; until flock -n 9; do n=$((n+1)); [ $n -ge 240 ] && { ec
 apt_install() { export DEBIAN_FRONTEND=noninteractive; apt-get install -y -q "$@" >>"$STATE_ROOT/apt.log" 2>&1 && return 0; apt-get update -q >>"$STATE_ROOT/apt.log" 2>&1 && apt-get install -y -q "$@" >>"$STATE_ROOT/apt.log" 2>&1; }
 pkg_install() { if have apt-get; then apt_install "$@"; elif have apk; then apk add --no-cache "$@" >>"$STATE_ROOT/apk.log" 2>&1; else return 1; fi; }
 if ! have fusermount3 && ! have fusermount; then pkg_install fuse3 || { echo "FSVOL_ERR fuse3-install"; tail -n 5 "$STATE_ROOT/apt.log" "$STATE_ROOT/apk.log" 2>/dev/null; exit 13; }; fi
+if ! have flock; then pkg_install util-linux || { echo 'FSVOL_ERR tool-missing flock'; exit 13; }; fi
 fsvol_fusermount >/dev/null || { echo "FSVOL_ERR fuse3-missing"; exit 13; }
-for t in setsid timeout awk sha256sum sed grep; do have "$t" || { echo "FSVOL_ERR tool-missing $t"; exit 13; }; done
+for t in setsid timeout awk sha256sum sed grep flock readlink tr; do have "$t" || { echo "FSVOL_ERR tool-missing $t"; exit 13; }; done
 rclone_ok() { b="$1"; v=$("$b" version 2>/dev/null | sed -n '1s/^rclone v\\([0-9][0-9.]*\\).*/\\1/p'); [ -n "$v" ] || return 1; maj=$(echo "$v" | cut -d. -f1); min=$(echo "$v" | cut -d. -f2); [ -n "$min" ] || min=0; [ "$maj" -gt ${minMajor} ] && return 0; [ "$maj" -eq ${minMajor} ] && [ "$min" -ge ${minMinor} ]; }
 RC=""
 if [ -x "$BIN_DIR/rclone" ] && rclone_ok "$BIN_DIR/rclone"; then RC="$BIN_DIR/rclone"; elif have rclone && rclone_ok "$(command -v rclone)"; then RC="$(command -v rclone)"; fi
@@ -234,6 +278,11 @@ export function mountFlags(spec: MountSpec): string {
     '--poll-interval', '0',
   ];
   if (spec.cacheMaxSize !== undefined) flags.push('--vfs-cache-max-size', spec.cacheMaxSize);
+  if (spec.bufferSize !== undefined) flags.push('--buffer-size', spec.bufferSize);
+  if (spec.readAhead !== undefined) flags.push('--vfs-read-ahead', spec.readAhead);
+  if (spec.readChunkSize !== undefined) flags.push('--vfs-read-chunk-size', spec.readChunkSize);
+  if (spec.readChunkSizeLimit !== undefined) flags.push('--vfs-read-chunk-size-limit', spec.readChunkSizeLimit);
+  if (spec.transfers !== undefined) flags.push('--transfers', String(spec.transfers));
   if (spec.allowOther) flags.push('--allow-other');
   if (spec.uid !== undefined) flags.push('--uid', String(spec.uid));
   if (spec.gid !== undefined) flags.push('--gid', String(spec.gid));
@@ -243,75 +292,117 @@ export function mountFlags(spec: MountSpec): string {
 }
 
 export function mountScript(paths: GuestPaths, spec: MountSpec): string {
-  const ticks = Math.max(4, Math.ceil(spec.readyTimeoutMs / 250));
+  // rclone v1.68.0 and v1.75.1: cmd/mountlib/{mount,rc}.go and
+  // cmd/mount/mount.go. External fusermount ends Wait(), but does not call
+  // VFS.Shutdown(). rcd keeps that VFS alive for a post-unmount drain;
+  // mount/unmount would shut it down too early and must NOT be used here.
+  const readySeconds = Math.max(1, Math.ceil(spec.readyTimeoutMs / 1000));
+  const mountOptions = JSON.stringify({ AllowOther: spec.allowOther });
+  // Verified against v1.68.0 and v1.75.1 vfs/vfscommon/options.go and
+  // fs/config.go: BufferSize/Transfers are global, not vfsOpt fields.
+  // SizeSuffix JSON strings use fs/sizesuffix.go parsing (bare numbers are
+  // KiB, explicit B means bytes). Preserve the caller's validated units.
+  const daemonFlags: string[] = [];
+  if (spec.bufferSize !== undefined) daemonFlags.push('--buffer-size', spec.bufferSize);
+  if (spec.transfers !== undefined) daemonFlags.push('--transfers', String(spec.transfers));
+  const vfsOptions = JSON.stringify({
+    CacheMode: spec.cacheMode === 'writes' ? 2 : 3, WriteBack: `${spec.writeBackSeconds}s`,
+    DirCacheTime: `${spec.dirCacheSeconds}s`, PollInterval: '0s', ReadOnly: spec.readOnly,
+    ...(spec.uid === undefined ? {} : { UID: spec.uid }), ...(spec.gid === undefined ? {} : { GID: spec.gid }),
+    ...(spec.umask === undefined ? {} : { Umask: parseInt(spec.umask, 8) }),
+    ...(spec.cacheMaxSize === undefined ? {} : { CacheMaxSize: spec.cacheMaxSize }),
+    ...(spec.readAhead === undefined ? {} : { ReadAhead: spec.readAhead }),
+    ...(spec.readChunkSize === undefined ? {} : { ChunkSize: spec.readChunkSize }),
+    ...(spec.readChunkSizeLimit === undefined ? {} : { ChunkSizeLimit: spec.readChunkSizeLimit }),
+  });
   if (spec.stateJson.includes("'")) throw new VolumeError('VALIDATION', 'Mount state must not contain single quotes.');
   return `${prelude(paths)}
 RC=$(fsvol_rclone) || { echo "FSVOL_ERR rclone-missing"; exit 14; }
 FM=$(fsvol_fusermount) || { echo "FSVOL_ERR fuse3-missing"; exit 13; }
 MP=${q(spec.mountPath)}
+fsvol_lock
+deadline=$(($(fsvol_now) + ${readySeconds}))
 MID=${q(spec.mountId)}
 REMOTE=${q(spec.remotePath)}
 RO=${spec.readOnly ? 1 : 0}
 SD="$STATE_ROOT/mounts/$MID"; SOCK="$RUN_ROOT/$MID.sock"; CACHE="$CACHE_ROOT/$MID"; LOG="$SD/rclone.log"
 mkdir -p "$SD" "$CACHE" "$RUN_ROOT" || { echo "FSVOL_ERR mkdir"; exit 11; }
 pid=""; [ -f "$SD/pid" ] && pid=$(cat "$SD/pid" 2>/dev/null)
-alive=0; fsvol_pid_alive "$pid" && alive=1
+if [ -f "$SD/mount.json" ] && [ ! -f "$SD/stopped" ]; then
+  case "$pid" in ''|*[!0-9]*|0|1) echo 'FSVOL_ERR path-in-use process-identity-missing'; exit 20;; esac
+fi
+alive=0; fsvol_owned "$pid" && alive=1
 if fsvol_mounted "$MP"; then
+  if [ "$(fsvol_find_state "$MP")" != "$SD" ] || ! grep -q -F "\\"mountId\\":\\"$MID\\"" "$SD/mount.json"; then echo 'FSVOL_ERR path-in-use mount-identity-mismatch'; exit 20; fi
   src=$(fsvol_mount_source "$MP")
   if [ "\${src#*:}" != "\${REMOTE#*:}" ]; then echo "FSVOL_ERR path-in-use $src"; exit 20; fi
-  if [ "$alive" = 1 ] && timeout 5 stat "$MP" >/dev/null 2>&1; then
+  if [ "$alive" = 1 ] && timeout ${readySeconds} stat "$MP" >/dev/null 2>&1; then
     if [ "$(fsvol_mount_ro "$MP")" != "$RO" ]; then echo "FSVOL_ERR path-in-use read-only-mismatch"; exit 20; fi
     echo "FSVOL_RESULT status=attached already=1 pid=$pid"; exit 0
   fi
-  "$FM" -uz "$MP" >/dev/null 2>&1 || umount -l "$MP" >/dev/null 2>&1
-  sleep 0.3
-  if fsvol_mounted "$MP"; then echo "FSVOL_ERR stale-unmount-failed"; exit 22; fi
+  echo "FSVOL_ERR path-in-use stale-mount-requires-detach"; exit 20
 fi
-if [ "$alive" = 1 ]; then kill "$pid" 2>/dev/null; sleep 0.5; kill -9 "$pid" 2>/dev/null; fi
+if fsvol_pid_alive "$pid"; then echo "FSVOL_ERR path-in-use existing-process-requires-detach"; exit 20; fi
 OTHER=$(fsvol_find_state "$MP")
 if [ -n "$OTHER" ] && [ "$OTHER" != "$SD" ]; then echo "FSVOL_ERR path-in-use stale-state $(basename "$OTHER")"; exit 20; fi
-rm -f "$SOCK" "$SD/pid"
 (umask 022; mkdir -p "$MP") || { echo "FSVOL_ERR mountpoint-create"; exit 21; }
 [ -d "$MP" ] || { echo "FSVOL_ERR mountpoint-not-dir"; exit 21; }
 if grep -q " $MP " /proc/mounts; then echo "FSVOL_ERR path-in-use foreign-mount"; exit 20; fi
 if [ -n "$(ls -A "$MP" 2>/dev/null)" ]; then echo "FSVOL_ERR mountpoint-not-empty"; exit 21; fi
+# Preserve stopped/PID evidence until preflight succeeds: a rejected reattach
+# must remain recoverable, including when a forced detach left no PID file.
+rm -f "$SOCK" "$SD/pid" "$SD/pid.start" "$SD/pid.exe" "$SD/quiesced" "$SD/stopped"
 printf '%s\\n' ${q(spec.stateJson)} > "$SD/mount.json"
+printf '%s\\n' "$REMOTE" > "$SD/remote"
 [ -f "$LOG" ] && mv -f "$LOG" "$LOG.1"
 : > "$SD/stderr.log"
+${daemonFlags.length ? `DAEMON_FLAGS=${q(daemonFlags.map(q).join(' '))}\n` : ''}\
 cat > "$SD/run.sh" <<FSVOL_RUN
 echo \\$\\$ > '$SD/pid'
-exec '$RC' mount '$REMOTE' '$MP' ${mountFlags(spec)} --cache-dir '$CACHE' --rc --rc-addr 'unix://$SOCK' --rc-no-auth --log-file '$LOG' --log-level INFO
+sed 's/.*) //' /proc/\\$\\$/stat | cut -d' ' -f20 > '$SD/pid.start'
+readlink -f '$RC' > '$SD/pid.exe'
+exec '$RC' rcd --cache-dir '$CACHE' --rc-addr 'unix://$SOCK' --rc-no-auth --log-file '$LOG' --log-level INFO${daemonFlags.length ? ' $DAEMON_FLAGS' : ''}
 FSVOL_RUN
-fail_cleanup() { rm -f "$SD/pid" "$SOCK"; mkdir -p "$STATE_ROOT/orphans"; mv "$SD" "$STATE_ROOT/orphans/$MID.$(date +%s).failed" 2>/dev/null; }
-setsid sh "$SD/run.sh" </dev/null >/dev/null 2>>"$SD/stderr.log" &
-i=0; pid=""
-while [ $i -lt ${ticks} ]; do
+fail_cleanup() { :; } # Keep recovery metadata and cache on any uncertainty.
+echo rcd > "$SD/driver"
+setsid sh "$SD/run.sh" 8>&- </dev/null >/dev/null 2>>"$SD/stderr.log" &
+created=0; pid=""
+while [ "$(fsvol_now)" -lt "$deadline" ]; do
   [ -z "$pid" ] && [ -f "$SD/pid" ] && pid=$(cat "$SD/pid" 2>/dev/null)
   if [ -n "$pid" ] && ! fsvol_pid_alive "$pid"; then
     echo "FSVOL_ERR process-exited"; fsvol_log_tail "$LOG"
     if [ -s "$SD/stderr.log" ]; then echo FSVOL_STDERR_BEGIN; tail -n 10 "$SD/stderr.log"; echo FSVOL_STDERR_END; fi
     fail_cleanup; exit 22
   fi
-  if [ -n "$pid" ] && fsvol_mounted "$MP" && timeout 5 ls "$MP" >/dev/null 2>&1; then echo "FSVOL_RESULT status=attached already=0 pid=$pid"; exit 0; fi
-  sleep 0.25; i=$((i+1))
+  remaining=$((deadline - $(fsvol_now))); [ "$remaining" -gt 0 ] || break
+  if [ "$created" = 0 ] && fsvol_owned "$pid" && [ -S "$SOCK" ]; then
+    created=1
+    if ! timeout "$remaining" "$RC" rc --unix-socket "$SOCK" mount/mount "fs=$REMOTE" "mountPoint=$MP" mountType=mount ${q(`mountOpt=${mountOptions}`)} ${q(`vfsOpt=${vfsOptions}`)} >>"$SD/stderr.log" 2>&1; then
+      echo 'FSVOL_ERR mount-create-failed'; fsvol_log_tail "$LOG"
+      echo FSVOL_STDERR_BEGIN; tail -n 10 "$SD/stderr.log"; echo FSVOL_STDERR_END; exit 22
+    fi
+  fi
+  remaining=$((deadline - $(fsvol_now))); [ "$remaining" -gt 0 ] || break
+  if fsvol_owned "$pid" && fsvol_mounted "$MP" && timeout "$remaining" ls "$MP" >/dev/null 2>&1; then echo "FSVOL_RESULT status=attached already=0 pid=$pid"; exit 0; fi
+  sleep 0.25
 done
 echo "FSVOL_ERR ready-timeout"; fsvol_log_tail "$LOG"
 if [ -s "$SD/stderr.log" ]; then echo FSVOL_STDERR_BEGIN; tail -n 10 "$SD/stderr.log"; echo FSVOL_STDERR_END; fi
-if [ -n "$pid" ]; then kill "$pid" 2>/dev/null; sleep 0.5; kill -9 "$pid" 2>/dev/null; fi
-"$FM" -uz "$MP" >/dev/null 2>&1; fail_cleanup; exit 23
+fail_cleanup; exit 23
 `;
 }
 
 export function inspectScript(paths: GuestPaths, mountPath: string): string {
   return `${prelude(paths)}
 MP=${q(mountPath)}
+fsvol_lock
 RC=$(fsvol_rclone) || RC=""
 mounted=0; fsvol_mounted "$MP" && mounted=1
 src=""; ro=""
 if [ "$mounted" = 1 ]; then src=$(fsvol_mount_source "$MP"); ro=$(fsvol_mount_ro "$MP"); fi
 SD=$(fsvol_find_state "$MP")
 state=0; pid=""; alive=0; responsive=0; mid=""
-if [ -n "$SD" ]; then state=1; mid=$(basename "$SD"); [ -f "$SD/pid" ] && pid=$(cat "$SD/pid" 2>/dev/null); fsvol_pid_alive "$pid" && alive=1; fi
+if [ -n "$SD" ]; then state=1; mid=$(basename "$SD"); SOCK="$RUN_ROOT/$mid.sock"; [ -f "$SD/pid" ] && pid=$(cat "$SD/pid" 2>/dev/null); fsvol_owned "$pid" && alive=1; fi
 if [ "$mounted" = 1 ] && timeout 5 stat "$MP" >/dev/null 2>&1; then responsive=1; fi
 echo "FSVOL_RESULT mounted=$mounted state=$state alive=$alive responsive=$responsive pid=$pid ro=$ro src=$src mid=$mid"
 if [ -n "$SD" ] && [ -f "$SD/mount.json" ]; then echo FSVOL_STATE_BEGIN; cat "$SD/mount.json"; echo; echo FSVOL_STATE_END; fi
@@ -325,6 +416,7 @@ export function detachScript(paths: GuestPaths, options: { mountPath: string; fl
   const flushSeconds = Math.max(1, Math.ceil(options.flushTimeoutMs / 1000));
   return `${prelude(paths)}
 MP=${q(options.mountPath)}
+fsvol_lock
 FLUSH=${flushSeconds}
 FORCE=${options.force ? 1 : 0}
 FM=$(fsvol_fusermount) || FM=""
@@ -340,60 +432,69 @@ MID=$(basename "$SD"); SOCK="$RUN_ROOT/$MID.sock"; LOG="$SD/rclone.log"; CACHE="
 vol=$(sed -n 's/.*"volumeId":"\\([^"]*\\)".*/\\1/p' "$SD/mount.json" 2>/dev/null)
 rostate=0; grep -q '"readOnly":true' "$SD/mount.json" 2>/dev/null && rostate=1
 pid=""; [ -f "$SD/pid" ] && pid=$(cat "$SD/pid" 2>/dev/null)
-alive=0; fsvol_pid_alive "$pid" && alive=1
+alive=0; fsvol_owned "$pid" && alive=1
 ro="$rostate"; [ "$mounted" = 1 ] && ro=$(fsvol_mount_ro "$MP")
-rc() { [ -n "$RC" ] && [ -S "$SOCK" ] && timeout 15 "$RC" rc --unix-socket "$SOCK" "$@" 2>/dev/null; }
-num() { sed -n "s/^[[:space:]]*\\"$1\\": *\\([0-9][0-9]*\\).*/\\1/p" | head -n 1; }
+deadline=$(($(fsvol_now) + FLUSH))
+rc() { remaining=$((deadline - $(fsvol_now))); [ "$remaining" -gt 0 ] && fsvol_owned "$pid" && [ -n "$RC" ] && [ -S "$SOCK" ] && timeout "$remaining" "$RC" rc --unix-socket "$SOCK" "$@" 2>/dev/null; }
+num() { sed -n "s/^[[:space:]]*\\"$1\\": *\\([0-9][0-9]*\\)[,[:space:]]*$/\\1/p" | head -n 1; }
 expedite() { qout=$(rc vfs/queue) || return 0; for id in $(echo "$qout" | sed -n 's/^[[:space:]]*"id": *\\([0-9][0-9]*\\).*/\\1/p'); do rc vfs/queue-set-expiry "id=$id" expiry=0 >/dev/null 2>&1; done; }
-stop_process() { if fsvol_pid_alive "$pid"; then kill "$pid" 2>/dev/null; j=0; while [ $j -lt 20 ] && fsvol_pid_alive "$pid"; do sleep 0.25; j=$((j+1)); done; fsvol_pid_alive "$pid" && kill -9 "$pid" 2>/dev/null; fi; return 0; }
+stop_process() {
+  case "$pid" in ''|*[!0-9]*|0|1) [ -f "$SD/stopped" ]; return $?;; esac
+  if fsvol_owned "$pid"; then
+    kill "$pid" 2>/dev/null
+    j=0; while [ $j -lt 20 ] && fsvol_owned "$pid"; do sleep 0.25; j=$((j+1)); done
+    if fsvol_owned "$pid"; then kill -9 "$pid" 2>/dev/null; fi
+    j=0; while [ $j -lt 20 ] && fsvol_owned "$pid"; do sleep 0.25; j=$((j+1)); done
+  fi
+  # A live but unverified PID is uncertainty, not proof of termination.
+  ! fsvol_pid_alive "$pid"
+}
 finish() {
+  if fsvol_mounted "$MP" || ! stop_process; then echo 'FSVOL_ERR stale cleanup-uncertain'; exit 32; fi
+  echo 1 > "$SD/stopped" || { echo 'FSVOL_ERR cleanup-failed'; exit 35; }
   rm -f "$SD/pid" "$SOCK"
-  if [ "$1" = 1 ]; then rm -rf "$CACHE" "$SD"; else mkdir -p "$STATE_ROOT/orphans" && mv "$SD" "$STATE_ROOT/orphans/$MID.$(date +%s)" 2>/dev/null; fi
+  if [ "$1" = 1 ]; then rm -rf "$CACHE" "$SD" || { echo 'FSVOL_ERR cleanup-failed'; exit 35; }; fi
   echo "FSVOL_RESULT status=detached flushed=$1 pending=$2 volume=$vol mid=$MID ro=$ro"; exit 0
 }
-if [ "$mounted" = 0 ]; then
-  stop_process
-  if [ "$rostate" = 1 ]; then finish 1 0; fi
-  if [ "$FORCE" = 1 ]; then finish 0 -1; fi
-  echo "FSVOL_ERR stale not-mounted"; fsvol_log_tail "$LOG"; exit 32
-fi
-if [ "$alive" = 0 ]; then
-  "$FM" -uz "$MP" >/dev/null 2>&1 || umount -l "$MP" >/dev/null 2>&1
-  if [ "$ro" = 1 ]; then finish 1 0; fi
-  if [ "$FORCE" = 1 ]; then finish 0 -1; fi
-  echo "FSVOL_ERR stale process-dead"; fsvol_log_tail "$LOG"; exit 32
-fi
-pending=0; errored=0
-if [ "$ro" = 0 ]; then
-  if [ -z "$RC" ] || [ ! -S "$SOCK" ]; then
-    if [ "$FORCE" = 1 ]; then "$FM" -uz "$MP" >/dev/null 2>&1; stop_process; finish 0 -1; fi
-    echo "FSVOL_ERR flush-unavailable no-rc-socket"; exit 30
+# A normal unmount quiesces writers. Lazy unmount does not: open descriptors
+# can keep writing, so a forced lazy detach must never discard the cache.
+if [ "$mounted" = 1 ]; then
+  expected=$(cat "$SD/remote" 2>/dev/null) || expected=""
+  if [ -z "$expected" ] || [ "\${src#*:}" != "\${expected#*:}" ]; then echo "FSVOL_ERR unmanaged $src"; exit 34; fi
+  out=$(timeout "$FLUSH" "$FM" -u "$MP" 2>&1); st=$?
+  if [ "$st" -ne 0 ]; then
+    if [ "$FORCE" = 1 ]; then
+      timeout 5 "$FM" -uz "$MP" >/dev/null 2>&1 || { echo "FSVOL_ERR unmount-failed $out"; exit 35; }
+      finish 0 -1
+    fi
+    case "$out" in *usy*) echo "FSVOL_ERR busy $out"; exit 31;; *) echo "FSVOL_ERR unmount-failed $out"; exit 35;; esac
   fi
-  limit=$((FLUSH * 4)); i=0; pending=-1
-  while :; do
-    expedite
-    s=$(rc vfs/stats) || s=""
-    qd=$(echo "$s" | num uploadsQueued); ip=$(echo "$s" | num uploadsInProgress); er=$(echo "$s" | num erroredFiles)
-    [ -n "$er" ] || er=0
-    if [ -n "$qd" ] && [ -n "$ip" ]; then pending=$((qd + ip)); errored=$er; if [ "$pending" -eq 0 ] && [ "$errored" -eq 0 ]; then break; fi; fi
-    [ $i -ge $limit ] && break
-    sleep 0.25; i=$((i+1))
-  done
-  if [ "$pending" -ne 0 ] || [ "$errored" -ne 0 ]; then
-    if [ "$FORCE" = 1 ]; then "$FM" -uz "$MP" >/dev/null 2>&1; stop_process; finish 0 "$pending"; fi
-    echo "FSVOL_ERR flush-timeout pending=$pending errored=$errored"; fsvol_log_tail "$LOG"; exit 30
+  fsvol_mounted "$MP" && { echo 'FSVOL_ERR unmount-failed still-mounted'; exit 35; }
+  # Only mounts created by this driver have a VFS that survives unmount.
+  if [ "$alive" = 1 ] && [ "$(cat "$SD/driver" 2>/dev/null)" = rcd ]; then echo 1 > "$SD/quiesced"; fi
+fi
+if [ "$alive" != 1 ] || [ ! -f "$SD/quiesced" ]; then
+  if [ "$FORCE" = 1 ]; then finish 0 -1; fi
+  echo 'FSVOL_ERR stale drain-not-verifiable'; exit 32
+fi
+pending=-1; errored=-1
+while [ "$(fsvol_now)" -lt "$deadline" ]; do
+  # Wait() removes the RC mount only after the FUSE server has finished. Do
+  # not mistake an empty queue during the last Release request for durability.
+  mounts=$(rc mount/listmounts) || mounts=""
+  if ! echo "$mounts" | grep -q '"mountPoints": *\\[\\]'; then sleep 0.25; continue; fi
+  expedite
+  s=$(rc vfs/stats) || s=""
+  qd=$(echo "$s" | num uploadsQueued); ip=$(echo "$s" | num uploadsInProgress); er=$(echo "$s" | num erroredFiles)
+  pending=-1; errored=-1
+  if [ -n "$qd" ] && [ -n "$ip" ] && [ -n "$er" ]; then
+    pending=$((qd + ip)); errored=$er
+    if [ "$pending" -eq 0 ] && [ "$errored" -eq 0 ]; then finish 1 0; fi
   fi
-fi
-out=$("$FM" -u "$MP" 2>&1); st=$?
-if [ "$st" -ne 0 ]; then
-  case "$out" in
-    *usy*) if [ "$FORCE" = 1 ]; then "$FM" -uz "$MP" >/dev/null 2>&1 || umount -l "$MP" >/dev/null 2>&1; stop_process; finish 0 -1; fi; echo "FSVOL_ERR busy $out"; exit 31;;
-    *) echo "FSVOL_ERR unmount-failed $out"; exit 35;;
-  esac
-fi
-i=0; while [ $i -lt 40 ] && fsvol_pid_alive "$pid"; do sleep 0.25; i=$((i+1)); done
-stop_process
-finish 1 0
+  sleep 0.25
+done
+if [ "$FORCE" = 1 ]; then finish 0 "$pending"; fi
+echo "FSVOL_ERR flush-timeout pending=$pending errored=$errored"; fsvol_log_tail "$LOG"; exit 30
 `;
 }
 
@@ -458,6 +559,8 @@ function mountError(run: GuestRun, out: GuestOutput, sandboxId: string, spec: Mo
   const details = guestFailure(run, out, sandboxId, { mountPath: spec.mountPath, mountId: spec.mountId });
   const logText = [...(out.blocks.LOG ?? []), ...(out.blocks.STDERR ?? [])].join('\n');
   switch (code) {
+    case 'lifecycle-busy':
+      return new MountError('MOUNT_BUSY', `Another guest lifecycle operation is running at ${spec.mountPath}. Retry when it finishes.`, { details });
     case 'rclone-missing':
     case 'fuse3-missing':
       return new MountError('RUNTIME_INSTALL', `Sandbox "${sandboxId}" lost its volume runtime (${code}).`, { hint: 'Attach again; the runtime is re-installed on the next attempt.', details });
@@ -478,6 +581,7 @@ function mountError(run: GuestRun, out: GuestOutput, sandboxId: string, spec: Mo
         hint: 'Run `fusermount3 -uz <path>` inside the sandbox, or restart the sandbox, then attach again.',
         details,
       });
+    case 'mount-create-failed':
     case 'process-exited': {
       if (/\/dev\/fuse not found|fuse device|Kernel module not loaded/i.test(logText)) {
         return new MountError('FUSE_UNAVAILABLE', `rclone could not open /dev/fuse in sandbox "${sandboxId}".`, {
@@ -492,7 +596,7 @@ function mountError(run: GuestRun, out: GuestOutput, sandboxId: string, spec: Mo
       return new MountError('MOUNT_FAILED', `rclone exited before the mount at ${spec.mountPath} in sandbox "${sandboxId}" became ready.`, { hint, details });
     }
     case 'ready-timeout':
-      return new MountError('MOUNT_TIMEOUT', `The mount at ${spec.mountPath} in sandbox "${sandboxId}" did not become ready within ${spec.readyTimeoutMs} ms. The process was stopped and the mount point cleaned up.`, {
+      return new MountError('MOUNT_TIMEOUT', `The mount at ${spec.mountPath} in sandbox "${sandboxId}" did not become ready within ${spec.readyTimeoutMs} ms. State and cache were retained for recovery; the process may still be running.`, {
         hint: 'This usually means the storage endpoint is unreachable from the sandbox (firewall, DNS, private endpoint). Raise readyTimeoutMs only if the endpoint is merely slow.',
         details,
       });
@@ -506,6 +610,8 @@ function detachError(run: GuestRun, out: GuestOutput, sandboxId: string, mountPa
   const detail = out.error?.detail ?? '';
   const details = guestFailure(run, out, sandboxId, { mountPath });
   switch (code) {
+    case 'lifecycle-busy':
+      return new MountError('MOUNT_BUSY', `Another guest lifecycle operation is running at ${mountPath}. Retry when it finishes.`, { details });
     case 'unmanaged':
       return new MountError('MOUNT_UNMANAGED', `${mountPath} in sandbox "${sandboxId}" is an rclone mount that freestyle-volumes did not create (${detail}).`, {
         hint: 'Unmount it manually inside the sandbox; this library only manages mounts it attached.',
@@ -513,7 +619,7 @@ function detachError(run: GuestRun, out: GuestOutput, sandboxId: string, mountPa
       });
     case 'stale':
       return new MountError('MOUNT_STALE', `The mount at ${mountPath} in sandbox "${sandboxId}" is stale (${detail}); pending writes may still sit in the sandbox cache and cannot be flushed.`, {
-        hint: 'Attach the same volume at the same path again to resume the pending uploads, then detach. Or detach with { force: true } to drop the mount state; the cache stays on the sandbox disk.',
+        hint: 'Retry detach if the uploader is still running. After a forced detach stops it, attach the same volume at the same path to resume pending uploads. State and cache stay on the sandbox disk when durability is uncertain.',
         details,
       });
     case 'busy':
@@ -523,7 +629,7 @@ function detachError(run: GuestRun, out: GuestOutput, sandboxId: string, mountPa
       });
     case 'flush-timeout':
     case 'flush-unavailable':
-      return new VolumeError('FLUSH_FAILED', `Pending writes under ${mountPath} in sandbox "${sandboxId}" could not be uploaded within ${flushTimeoutMs} ms (${detail}). The mount is still attached; nothing was discarded.`, {
+      return new VolumeError('FLUSH_FAILED', `Pending writes under ${mountPath} in sandbox "${sandboxId}" could not be uploaded within ${flushTimeoutMs} ms (${detail}). The filesystem may already be unmounted; state and cache were retained for recovery.`, {
         hint: 'Check that the sandbox can reach the storage endpoint and retry detach with a larger flushTimeoutMs, or detach with { force: true } to give up durability for the pending files.',
         details,
       });

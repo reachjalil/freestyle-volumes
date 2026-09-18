@@ -1,0 +1,30 @@
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import { PutObjectCommand, GetObjectCommand } from '@aws-sdk/client-s3';
+import { FreestyleVolumes, S3ObjectStore, resolveStorage } from '../../dist/index.js';
+import { Stack, dockerAvailable } from '../helpers/stack.mjs';
+
+test('MinIO server-side clone preserves binary bytes and encoded names without guest or host data reads', { skip: !dockerAvailable() }, async t => {
+  const stack = new Stack();
+  t.after(() => stack.stop());
+  await stack.start();
+  const config = stack.storage('clone');
+  const store = new S3ObjectStore(resolveStorage(config));
+  const volumes = new FreestyleVolumes({ storage: config, objectStore: store, sandboxes: { get() { assert.fail('clone must not resolve a guest'); } } });
+  const source = await volumes.create({ name: 'source' });
+  const binary = Buffer.from(Array.from({ length: 65539 }, (_, i) => i % 256));
+  const suffix = "nested/space +%#é!'().bin";
+  await stack.s3.send(new PutObjectCommand({ Bucket: stack.bucket, Key: `${source.dataPrefix}/${suffix}`, Body: binary, ContentType: 'application/octet-stream' }));
+  await stack.s3.send(new PutObjectCommand({ Bucket: stack.bucket, Key: `${source.dataPrefix}/empty/`, Body: '' }));
+  const get = store.getObject.bind(store);
+  store.getObject = key => { assert.ok(!key.startsWith(source.dataPrefix)); return get(key); };
+  const result = await volumes.clone({ sourceVolumeId: 'source', name: 'target', concurrency: 2 });
+  assert.equal(result.copiedObjects, 2);
+  assert.equal(result.copiedBytes, binary.length);
+  const response = await stack.s3.send(new GetObjectCommand({ Bucket: stack.bucket, Key: `${result.volume.dataPrefix}/${suffix}` }));
+  assert.deepEqual(Buffer.from(await response.Body.transformToByteArray()), binary);
+  assert.equal(response.ContentType, 'application/octet-stream');
+  assert.deepEqual(await stack.listKeys(`${result.volume.dataPrefix}/`), [`${result.volume.dataPrefix}/empty/`, `${result.volume.dataPrefix}/${suffix}`]);
+  await assert.rejects(store.copyObject(`${source.dataPrefix}/${suffix}`, `${result.volume.dataPrefix}/wrong`, { size: binary.length, sourceIfMatch: '"not-the-etag"' }), { code: 'STORAGE_ERROR' });
+  assert.deepEqual(await volumes.get('target'), result.volume);
+});

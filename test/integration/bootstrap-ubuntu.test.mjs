@@ -17,7 +17,7 @@ test('bootstrap installs fuse3 and the pinned rclone on Ubuntu 24.04 and mounts'
     const volumes = new FreestyleVolumes({ storage: stack.storage('ubuntu'), sandboxes: dockerSandboxes(), defaults: { writeBackSeconds: 1 } });
     const sandbox = stack.sandbox({ image: 'ubuntu:24.04' });
     assert.equal(stack.exec(sandbox, 'command -v rclone || command -v fusermount3 || echo none').stdout.trim(), 'none', 'bare image has neither rclone nor fusermount3');
-    await volumes.create({ name: 'u' });
+    const volume = await volumes.create({ name: 'u' });
     const started = Date.now();
     const attached = await volumes.attach({ sandboxId: sandbox, volumeId: 'u', mountPath: '/mnt/u' });
     assert.ok(attached.pid > 0);
@@ -26,7 +26,7 @@ test('bootstrap installs fuse3 and the pinned rclone on Ubuntu 24.04 and mounts'
     assert.equal(stack.exec(sandbox, 'echo ubuntu > /mnt/u/ok.txt').status, 0);
     const detached = await volumes.detach({ sandboxId: sandbox, mountPath: '/mnt/u' });
     assert.equal(detached.flushed, true);
-    assert.equal(await stack.readObject('ubuntu/v/u/ok.txt'), 'ubuntu\n');
+    assert.equal(await stack.readObject(`${volume.dataPrefix}/ok.txt`), 'ubuntu\n');
     console.log(`bootstrap + mount + detach on ubuntu:24.04 took ${Math.round((Date.now() - started) / 1000)}s`);
   } finally {
     await stack.stop();
