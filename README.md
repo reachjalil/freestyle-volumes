@@ -67,7 +67,7 @@ await volumes.attach({ sandboxId: other.vmId, volumeId: volume.id, mountPath: '/
 console.log((await other.vm.exec('cat /mnt/datasets/hello.txt')).stdout); // hello
 ```
 
-The first attach on a fresh VM installs `fuse3` and a pinned, checksum-verified rclone; that took 15 s on `freestyle/ubuntu-sm` in the live test. [Prepare a snapshot](#fast-attach-with-a-volume-ready-snapshot) to skip that. The complete example is [examples/freestyle.ts](examples/freestyle.ts).
+The first attach on a fresh VM installs `fuse3` and a pinned, checksum-verified rclone; that took 15 s on `freestyle/ubuntu-sm` in the live test, against about 1.5 s from a volume-ready snapshot. [Prepare a snapshot](#fast-attach-with-a-volume-ready-snapshot) to skip that. The complete example is [examples/freestyle.ts](examples/freestyle.ts).
 
 Freestyle checklist:
 
@@ -76,6 +76,26 @@ Freestyle checklist:
 2. Allow outbound traffic to the storage endpoint, plus `downloads.rclone.org` and the apt mirrors on first use. The broad rule above is a starting point, not least privilege.
 3. Attach with `uid: 1000, gid: 1000` when the VM's default `ubuntu` user should own the files. Mounts use `allowOther`, so every user can reach them either way.
 4. Detach before snapshotting or deleting a VM: `await volumes.detachAll({ sandboxId: vmId })` drains every mount and reports `flushed: true` when nothing is left behind. A snapshot taken while attached captures the mount process, its credentials (in its environment) and its write cache.
+
+## Storage setup: Cloudflare R2
+
+This is the setup the live tests ran on. R2 enforces the conditional creates that volume creation relies on, and a token scoped to one bucket is enough for everything, including delete and `doctor`.
+
+1. Create a bucket: `npx wrangler r2 bucket create my-volumes`.
+2. Create S3 credentials in the dashboard, since wrangler cannot mint them: **R2 Object Storage → Manage API tokens → Create Account API token**, permission **Object Read & Write**, applied to that bucket only. Copy the Access Key ID and the Secret Access Key.
+3. Configure, with your account id from `npx wrangler whoami`:
+
+   ```bash
+   VOLUMES_S3_ENDPOINT=https://<account-id>.r2.cloudflarestorage.com
+   VOLUMES_S3_REGION=auto
+   VOLUMES_S3_PROVIDER=Cloudflare
+   VOLUMES_S3_BUCKET=my-volumes
+   VOLUMES_S3_ACCESS_KEY_ID=...
+   VOLUMES_S3_SECRET_ACCESS_KEY=...
+   ```
+4. Run `npx freestyle-volumes doctor`; every storage check should pass.
+
+For AWS S3, omit the endpoint and set `region`. For MinIO, set the endpoint and `provider: 'Minio'`; the integration suite runs against it. For other providers, run `doctor` first: it fails if the provider does not reject a duplicate conditional create.
 
 ## Fast attach with a volume-ready snapshot
 
@@ -317,7 +337,7 @@ Details and the failure matrix live in [docs/semantics.md](docs/semantics.md).
 
 | Environment | Supported | Notes |
 | :--- | :--- | :--- |
-| Freestyle `freestyle/ubuntu*` (Ubuntu 24.04) | Partly verified | Root exec, `/dev/fuse`, mounts that outlive their exec, the 15 s bootstrap and volume-ready snapshots verified live on `freestyle/ubuntu-sm` (2026-09-25). The storage round trip is pending (see [project status](#project-status)). |
+| Freestyle `freestyle/ubuntu*` (Ubuntu 24.04) | Yes | Verified live on `freestyle/ubuntu-sm` (x86_64) with Cloudflare R2 on 2026-09-25: storage round trip across two VMs, volume-ready snapshots, pause and resume. Other sizes and arm64 have not been run live. |
 | Freestyle `freestyle/busybox` | No | No package manager for `fuse3`; attach fails with `RUNTIME_INSTALL`. |
 | Docker container | Yes | Needs `--device /dev/fuse --cap-add SYS_ADMIN` (and `--security-opt apparmor:unconfined` where AppArmor is enforced). Verified in CI and locally. |
 | gVisor / containers without `/dev/fuse` | No | `FUSE_UNAVAILABLE`, detected before anything is installed. |
@@ -357,9 +377,9 @@ Preview (`0.x`): the API can change between minor versions, and each change is l
 | Unit tests (mocked VM, in-memory store, guest scripts run in a local shell) | Validation, script generation, error mapping, registry, clone, Git checks, CLI, snapshot helper, mount listing, preflight checks | `pnpm test`: 146 passed, 0 skipped. SDK and example type checks passed. |
 | Package smoke test | The packed tarball installs and works: ESM and `require()`, the CLI bin, TypeScript under nodenext, bundler and node10 | `pnpm test:package`: passed. |
 | Linux integration (Docker + MinIO, real rclone FUSE) | Lifecycle, isolation, failure recovery, post-unmount drain, `detachAll` with crashed and unmanaged mounts, preflight checks, Git on FUSE, the CLI end to end, bare Ubuntu bootstrap, minimum and pinned rclone | `VOLUMES_TEST_BOOTSTRAP=1 pnpm test:integration`: 33 passed, 0 skipped (local Docker, linux/arm64). CI runs the same suite on linux/amd64. |
-| Freestyle live (real VMs, billed) | FUSE, the bootstrap, processes and mounts that outlive their exec, the snapshot build, and the storage round trip | The runtime test passed and `createVolumeReadySnapshot` built a working snapshot on `freestyle/ubuntu-sm`. **The storage round trip is pending** a bucket credential: run the manual [Freestyle live test](.github/workflows/freestyle-live.yml) workflow or `pnpm test:freestyle`. |
+| Freestyle live (real VMs and Cloudflare R2, billed) | The runtime, the two-VM storage round trip, a volume-ready snapshot, pause and resume with an upload pending, and both preflights | `pnpm test:freestyle`: 4 passed on `freestyle/ubuntu-sm`, twice. Bootstrap 15 s on a fresh VM, attach 1.3–1.5 s from a volume-ready snapshot, and pause and resume each under a second with the mount and its pending upload intact. Rerun with the manual [Freestyle live test](.github/workflows/freestyle-live.yml) workflow. |
 
-Docker results are not Freestyle results: they exercise the mount mechanics on real FUSE. On Freestyle itself, the runtime and snapshot behavior is verified live, and the storage round trip is still to come. Multipart copy is verified with a small real fixture plus mocked large-size boundaries, not an actual 5 TiB copy; Git with local smart HTTP on real FUSE, not live authenticated GitHub. Details and history: [docs/evidence](docs/evidence/v0.2.md).
+Docker results and live Freestyle results are reported separately: the Docker suite covers failure modes that are hard to provoke on a real VM (crashes, flush failures, busy mounts), and the live suite proves the happy paths on Freestyle and R2. Not yet run live: stop/start recovery, other VM sizes and arm64, throughput. Multipart copy is verified with a small real fixture plus mocked large-size boundaries, not an actual 5 TiB copy; Git with local smart HTTP on real FUSE, not live authenticated GitHub. Details and history: [docs/evidence](docs/evidence/v0.2.md).
 
 ## Security notes
 

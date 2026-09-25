@@ -2,7 +2,7 @@
 
 ## Current verification status
 
-Pre-release run for 0.2.0 — **2026-09-25**: `pnpm test`: 146 passed, 0 skipped; `pnpm check:types`, `pnpm check:examples` and `pnpm test:package` passed; `VOLUMES_TEST_BOOTSTRAP=1 pnpm test:integration`: 33 passed, 0 failed, 0 skipped on Docker. Live on Freestyle the same day (freestyle/ubuntu-sm, Ubuntu 24.04.5, x86_64): the runtime test passed, and `createVolumeReadySnapshot` built a snapshot that a new VM booted from with the runtime in place. **The storage round trip (a real volume on a real bucket) and pause/resume have not been validated yet.** Neither the Docker results nor the local host clone/list benchmark is Freestyle runtime evidence. See [verification](evidence/v0.2.md) (earlier runs in [v0.1](evidence/v0.1.md)), [performance](performance.md) and [source-linked research](freestyle-research.md).
+Pre-release run for 0.2.0 — **2026-09-25**: `pnpm test`: 146 passed, 0 skipped; `pnpm check:types`, `pnpm check:examples` and `pnpm test:package` passed; `VOLUMES_TEST_BOOTSTRAP=1 pnpm test:integration`: 33 passed, 0 failed, 0 skipped on Docker. Live on Freestyle the same day (`freestyle/ubuntu-sm`, Ubuntu 24.04.5, x86_64) against Cloudflare R2: all four live tests passed, covering the runtime, the two-VM storage round trip, a volume-ready snapshot with a volume attached from it, and a mount with a pending upload surviving pause and resume. Details and timings are below and in [the evidence](evidence/v0.2.md#live-freestyle-run--2026-09-25). Neither the Docker results nor the local host clone/list benchmark is Freestyle runtime evidence. See [verification](evidence/v0.2.md) (earlier runs in [v0.1](evidence/v0.1.md)), [performance](performance.md) and [source-linked research](freestyle-research.md).
 
 ## Facts taken from Freestyle's documentation and SDK (`freestyle@0.2.14`)
 
@@ -23,18 +23,22 @@ Pre-release run for 0.2.0 — **2026-09-25**: `pnpm test`: 146 passed, 0 skipped
 
 ## Verified live on Freestyle — 2026-09-25
 
-On `freestyle/ubuntu-sm` (Ubuntu 24.04.5 LTS, x86_64, 16 GB disk), with `test/freestyle/runtime.test.mjs` and an equivalent one-off probe:
+On `freestyle/ubuntu-sm` (Ubuntu 24.04.5 LTS, x86_64, 16 GB disk), storage on Cloudflare R2, with the four tests in `test/freestyle/`:
 
 1. **Background processes started from `vm.exec` keep running after the call returns.** A `setsid` process started by one exec was alive in the next, and an rclone FUSE mount started by one exec was still mounted and readable in the next. The PTY fallback is not needed.
 2. **`/dev/fuse` exists** (a `crw-rw-rw-` character device), scripts run as root, and bootstrap installs `fuse3` with apt; `flock` is preinstalled.
 3. **Outbound HTTPS reaches `downloads.rclone.org`** with the broad public-egress firewall rule, and the pinned rclone passes its SHA-256 check.
 4. **First-attach bootstrap took 15.1 s** on a fresh VM (apt plus the 30 MB download). The runtime check of `checkSandbox` passed on the VM; only its storage check failed, because it was given deliberately invalid keys.
-5. **Snapshots keep the runtime.** `createVolumeReadySnapshot` took 22.6 s end to end (builder VM 0.4 s, bootstrap 15 s, snapshot 7 s) and deleted its builder; a VM booted from the snapshot had `/opt/freestyle-volumes/bin/rclone` 1.75.1, `fusermount3` and `flock` without installing anything.
+5. **Snapshots keep the runtime.** `createVolumeReadySnapshot` took 22.5 s end to end (builder VM 0.4 s, bootstrap 15 s, snapshot 7 s) and deleted its builder; a VM booted from the snapshot had `/opt/freestyle-volumes/bin/rclone` 1.75.1, `fusermount3` and `flock` without installing anything, and **attach took 1.3–1.5 s** there.
+6. **The storage round trip works.** The library's own `rclone rcd` mount of an R2 bucket, writes as the `ubuntu` user through `uid: 1000`, a verified-drain detach, reattach and read-back on a second VM, a read-only mount that rejects writes, `listMounts` and `detachAll` with `flushed: true`, and delete (`test/freestyle/live.test.mjs`, 45 s with two fresh VMs).
+7. **The preflight works from inside a VM.** `checkSandbox` on a VM booted from the snapshot listed the bucket with the exec-env credentials ("rclone listed the namespace from inside the sandbox"); on a fresh VM it reported the installs attach would do, and R2 answered its unauthenticated probe with HTTP 400.
+8. **Pause and resume keep the mount and its pending uploads.** With a write still queued in the VM's cache, pause and resume each took under a second (pause 0.2–0.4 s, resume 0.07–0.66 s over three runs); the mount was healthy and responsive, the queued upload drained on the next detach (`flushed: true`), and both files read back from the bucket (`test/freestyle/pause.test.mjs`).
 
 ## Not yet verified on Freestyle
 
-1. **The storage round trip:** the library's own `rclone rcd` mount of a real bucket, writes as the `ubuntu` user, a verified-drain detach and reattach on a second VM (`test/freestyle/live.test.mjs`).
-2. **Pause/resume keeps the mount usable.** This is an expectation based on process preservation and rclone retries, not a validated result. The round trip alone does not prove pause/resume recovery.
+1. **Stop and start.** A stopped VM boots fresh, so its mounts become `stale` and follow the documented recovery (reattach, then detach). That path is covered in Docker, not live on Freestyle.
+2. **Other sizes, images and CPUs.** Only `freestyle/ubuntu-sm` on x86_64 has been exercised live.
+3. **Throughput.** Large files and sustained transfer rates have not been measured on Freestyle.
 
 ## Volume-ready snapshots
 
@@ -44,11 +48,11 @@ On `freestyle/ubuntu-sm` (Ubuntu 24.04.5 LTS, x86_64, 16 GB disk), with `test/fr
 2. The same bootstrap script `attach` runs installs `fuse3`, `flock` and the pinned, SHA-256-verified rclone as `root`. Errors map to the usual codes (`FUSE_UNAVAILABLE`, `RUNTIME_INSTALL`, `SANDBOX_EXEC_TIMEOUT`), and nothing is snapshotted when it fails.
 3. `vm.snapshot({ slug, displayName })` captures the VM, and the builder VM is deleted. A failed delete is reported in `warnings` and the TTL cleans up.
 
-No storage credentials exist at any point of the build, so none can be captured. Attach on a VM booted from the snapshot still runs the bootstrap check, but it finds rclone `>= 1.68`, `fusermount3` and `flock` already installed, so nothing is downloaded. The build took 22.6 s on `freestyle/ubuntu-sm` in the live run, against 15.1 s of bootstrap saved on every VM's first attach. Rebuild the snapshot when you want a newer base image; library upgrades keep working with the installed rclone unless a release raises the minimum version.
+No storage credentials exist at any point of the build, so none can be captured. Attach on a VM booted from the snapshot still runs the bootstrap check, but it finds rclone `>= 1.68`, `fusermount3` and `flock` already installed, so nothing is downloaded. The build took 22.5 s on `freestyle/ubuntu-sm` in the live run; afterwards, attach on a VM booted from the snapshot took 1.3–1.5 s instead of paying the 15 s bootstrap. Rebuild the snapshot when you want a newer base image; library upgrades keep working with the installed rclone unless a release raises the minimum version.
 
 ## Running the live test
 
-The live tests are billed to your Freestyle account. `test/freestyle/runtime.test.mjs` needs only `FREESTYLE_API_KEY`: it boots one VM, runs the first-attach bootstrap and checks FUSE plus processes and mounts that outlive their exec. The other two need a bucket you control. `test/freestyle/live.test.mjs` creates two `freestyle/ubuntu-sm` VMs, runs the round trip, and deletes them and the volume. `test/freestyle/snapshot.test.mjs` runs only with `VOLUMES_TEST_PREPARE_SNAPSHOT=1`: it builds a volume-ready snapshot, boots a VM from it, checks that the runtime is preinstalled, round-trips a file, and deletes the VM, the snapshot and the volume.
+The live tests are billed to your Freestyle account. `test/freestyle/runtime.test.mjs` needs only `FREESTYLE_API_KEY`: it boots one VM, runs the first-attach bootstrap and checks FUSE plus processes and mounts that outlive their exec. The others need a bucket you control. `test/freestyle/pause.test.mjs` pauses and resumes a VM with an upload pending. `test/freestyle/live.test.mjs` creates two `freestyle/ubuntu-sm` VMs, runs the round trip, and deletes them and the volume. `test/freestyle/snapshot.test.mjs` runs only with `VOLUMES_TEST_PREPARE_SNAPSHOT=1`: it builds a volume-ready snapshot, boots a VM from it, checks that the runtime is preinstalled, round-trips a file, and deletes the VM, the snapshot and the volume.
 
 The easiest way to run both is the manual **Freestyle live test** workflow (`.github/workflows/freestyle-live.yml`): add the repository secrets `FREESTYLE_API_KEY`, `VOLUMES_S3_ACCESS_KEY_ID` and `VOLUMES_S3_SECRET_ACCESS_KEY` and the variable `VOLUMES_S3_BUCKET` (plus `VOLUMES_S3_ENDPOINT`, `VOLUMES_S3_REGION` and `VOLUMES_S3_PROVIDER` for R2 or MinIO), then start it from the Actions tab. Each run uses its own bucket prefix. Locally:
 

@@ -49,7 +49,11 @@ npm version patch && git push --follow-tags && npm publish
 1. `pnpm install --frozen-lockfile`.
 2. `npm publish --dry-run`: runs `pnpm test`, `pnpm check:types`, `pnpm check:examples` and `pnpm test:package`, then lists the tarball: `dist/`, `src/`, `README.md`, `LICENSE`, `CHANGELOG.md` and `package.json` only.
 3. `VOLUMES_TEST_BOOTSTRAP=1 pnpm test:integration` on a host with Docker. CI runs it on every push.
-4. The live Freestyle tests (billed): run the manual **Freestyle live test** workflow, which reads repository secrets and variables, or locally `VOLUMES_TEST_PREPARE_SNAPSHOT=1 pnpm test:freestyle` with `FREESTYLE_API_KEY` and `VOLUMES_S3_*` set. Record the outcome in `docs/evidence/`.
+4. The live Freestyle tests (billed, a few minutes of small VMs): run the manual **Freestyle live test** workflow, which reads repository secrets and variables, or locally with the key and bucket settings in gitignored env files:
+   ```bash
+   VOLUMES_TEST_PREPARE_SNAPSHOT=1 node --env-file=.env.freestyle --env-file=.env.r2 --test --test-concurrency=1 test/freestyle/*.test.mjs
+   ```
+   where `.env.r2` holds `VOLUMES_S3_ENDPOINT`, `VOLUMES_S3_REGION`, `VOLUMES_S3_PROVIDER`, `VOLUMES_S3_BUCKET` and the two keys. Record the outcome in `docs/evidence/`.
 5. Update `CHANGELOG.md` and the README's project status, then bump the version and tag `vX.Y.Z`.
 
 ## When a release is broken
