@@ -84,4 +84,16 @@ A successful commit is **guest-local**: Git objects/index/refs may still be in t
 
 `VolumeGitError` is separate from `VolumeError`. Codes are `GIT_VALIDATION`, `GIT_MOUNT`, `GIT_UNSAFE_REPOSITORY`, `GIT_INDEX_NOT_EMPTY`, `GIT_FAILED`, `GIT_TIMEOUT` and `GIT_EXEC`. Its `outcomeUnknown` flag can indicate partial or uncertain mutation; absence of that flag is not a universal rollback guarantee. Exec errors/timeouts can leave a partial clone, staged index, changed worktree/refs, unfinished guest process or remotely accepted push. Quiesce and inspect repository/process/remote state before retrying; do not automatically clean, re-commit, force-push or retry. No raw Git output is exposed in errors because it may contain credentials.
 
-Implementation: [`src/git.ts`](../src/git.ts). Final main-run verification on **2026-09-18**: 112 unit tests passed (0 skipped), 26 integration tests passed (0 failed, 0 skipped), and SDK/example type checks passed. Git coverage includes unit tests, local smart HTTP and real-FUSE Git; it does **not** establish live authenticated GitHub success or blanket repository compatibility. The Freestyle live test was skipped for missing credentials, so no live Freestyle round trip or pause/resume is validated. See [verification evidence](evidence/v0.1.md).
+## Cost on an object-store mount
+
+Every call except `clone` first checks the repository: one walk of the whole tree (each directory is a listing request against the bucket once the directory cache expires) that rejects anything but plain files and directories, hard-linked files and nested `.git` entries, then reads `.git/config` and the index. `pull` checks again after merging, and `clone` checks twice. Git itself then stats the worktree. On a repository with thousands of directories this is slow and costs listing requests, which is one more reason to keep active repositories on VM disk and use this helper for occasional, explicit operations.
+
+## Verification
+
+Implementation: [`src/git.ts`](../src/git.ts). Unit tests run real Git against local smart HTTP, and the integration suite runs Git on a real rclone FUSE mount in Docker. `test/integration/git-github.test.mjs` runs the helper against live GitHub (token clone, commit on FUSE, push of a new branch, pull, then the branch is deleted); it is opt-in because it writes to a repository:
+
+```bash
+VOLUMES_TEST_GITHUB_REPO=owner/name VOLUMES_TEST_GITHUB_TOKEN=... pnpm test:integration
+```
+
+Use a fine-grained token with Contents read and write on that repository only. None of this establishes blanket repository compatibility. Current results are in the [verification record](evidence/v0.2.md).

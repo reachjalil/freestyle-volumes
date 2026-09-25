@@ -9,8 +9,8 @@ import { dockerSandboxes } from './docker.js';
 import { isVolumeError } from './errors.js';
 import { createVolumeReadySnapshot, freestyleSandboxes, type FreestyleClientLike, type FreestyleSnapshotClientLike } from './freestyle.js';
 import type { SandboxResolver } from './sandbox.js';
-import { storageConfigFromEnv, type ObjectStore } from './storage.js';
-import { FreestyleVolumes, type AttachVolumeOptions, type CheckReport, type DetachAllOptions, type DetachAllResult } from './volumes.js';
+import { sandboxCredentialsFromEnv, storageConfigFromEnv, type ObjectStore } from './storage.js';
+import { FreestyleVolumes, type AttachVolumeOptions, type CheckReport, type DetachAllOptions, type DetachAllResult, type FlushAllResult, type FlushResult, type RestoreMountsResult } from './volumes.js';
 
 type Env = Record<string, string | undefined>;
 type Options = NonNullable<ParseArgsConfig['options']>;
@@ -62,12 +62,14 @@ const LABEL_OPTION: Options = { label: { type: 'string', multiple: true } };
 /** Flag name → attach option. Numbers are parsed here; the library validates ranges. */
 const MOUNT_FLAGS: Record<string, { key: keyof AttachVolumeOptions; kind: 'string' | 'integer' | 'boolean' }> = {
   'read-only': { key: 'readOnly', kind: 'boolean' },
+  exclusive: { key: 'exclusive', kind: 'boolean' },
   subpath: { key: 'subpath', kind: 'string' },
   uid: { key: 'uid', kind: 'integer' },
   gid: { key: 'gid', kind: 'integer' },
   umask: { key: 'umask', kind: 'string' },
   'cache-mode': { key: 'cacheMode', kind: 'string' },
   'cache-max-size': { key: 'cacheMaxSize', kind: 'string' },
+  'cache-min-free-space': { key: 'cacheMinFreeSpace', kind: 'string' },
   'write-back': { key: 'writeBackSeconds', kind: 'integer' },
   'dir-cache': { key: 'dirCacheSeconds', kind: 'integer' },
   'buffer-size': { key: 'bufferSize', kind: 'string' },
@@ -81,10 +83,11 @@ const MOUNT_FLAGS: Record<string, { key: keyof AttachVolumeOptions; kind: 'strin
 
 const COMMANDS: Record<string, Command> = {
   list: {
-    usage: 'list',
-    summary: 'List the volumes in the namespace.',
+    usage: 'list [--skip-invalid]',
+    summary: 'List the volumes in the namespace; --skip-invalid skips malformed records.',
     positionals: [],
-    run: async (context) => (await volumesFor(context)).list(),
+    options: { 'skip-invalid': { type: 'boolean' } },
+    run: async (context) => (await volumesFor(context)).list({ skipInvalid: context.values['skip-invalid'] === true }),
   },
   get: {
     usage: 'get <volume>',
@@ -120,6 +123,54 @@ const COMMANDS: Record<string, Command> = {
     run: async (context, [name]) => {
       if (context.values.confirm !== name) throw new UsageError(`Refusing to delete "${name}" and all of its data: repeat the name with --confirm ${name}.`);
       return (await volumesFor(context)).delete({ volumeId: name!, confirm: name!, force: context.values.force === true });
+    },
+  },
+  usage: {
+    usage: 'usage <volume>',
+    summary: 'Count the objects and bytes stored for a volume.',
+    positionals: ['volume'],
+    run: async (context, [name]) => (await volumesFor(context)).usage(name!),
+  },
+  lease: {
+    usage: 'lease <volume>',
+    summary: 'Show which mount holds the exclusive-writer lease of a volume, if any.',
+    positionals: ['volume'],
+    run: async (context, [name]) => (await volumesFor(context)).getLease(name!),
+  },
+  'release-lease': {
+    usage: 'release-lease <volume> --confirm <volume>',
+    summary: 'Release a lease whose VM is gone; repeat the name with --confirm.',
+    positionals: ['volume'],
+    options: { confirm: { type: 'string' } },
+    run: async (context, [name]) => {
+      if (context.values.confirm !== name) throw new UsageError(`Refusing to release the lease of "${name}": repeat the name with --confirm ${name} once its holder no longer writes.`);
+      return (await volumesFor(context)).releaseLease({ volumeId: name!, confirm: name! });
+    },
+  },
+  reconcile: {
+    usage: 'reconcile [--remove-stale]',
+    summary: 'Report leftovers; --remove-stale deletes records that point at nothing.',
+    positionals: [],
+    options: { 'remove-stale': { type: 'boolean' } },
+    run: async (context) => {
+      const volumes = await volumesFor(context);
+      const report = await volumes.reconcile();
+      if (context.values['remove-stale'] !== true) return report;
+      return { report, removed: await volumes.registry.removeStaleRecords(report) };
+    },
+  },
+  'remove-orphan': {
+    usage: 'remove-orphan <volume> <generation> --confirm <volume>/<generation>',
+    summary: 'Delete a generation reconcile reported; --min-age <s> (default 86400).',
+    positionals: ['volume', 'generation'],
+    options: { confirm: { type: 'string' }, 'min-age': { type: 'string' } },
+    run: async (context, [volumeId, generation]) => {
+      const target = `${volumeId}/${generation}`;
+      if (context.values.confirm !== target) throw new UsageError(`Refusing to delete generation ${target}: repeat it with --confirm ${target}.`);
+      const options: Parameters<FreestyleVolumes['removeOrphanGeneration']>[0] = { volumeId: volumeId!, generation: generation!, confirm: target };
+      const minAge = integer(context.values, 'min-age');
+      if (minAge !== undefined) options.minAgeSeconds = minAge;
+      return (await volumesFor(context)).removeOrphanGeneration(options);
     },
   },
   attachments: {
@@ -166,6 +217,51 @@ const COMMANDS: Record<string, Command> = {
         context.stderr('warning: detached without a verified flush; pending uploads stay in the sandbox cache. Reattach the same volume at the same path to resume them.\n');
       }
       return result;
+    },
+  },
+  flush: {
+    usage: 'flush <vm> <mountPath> [--flush-timeout <ms>]',
+    summary: 'Upload every closed file now and keep the mount (a checkpoint).',
+    positionals: ['vm', 'mountPath'],
+    options: { 'flush-timeout': { type: 'string' } },
+    run: async (context, [sandboxId, mountPath]) => {
+      const options: Parameters<FreestyleVolumes['flush']>[0] = { sandboxId: sandboxId!, mountPath: mountPath! };
+      const flushTimeoutMs = integer(context.values, 'flush-timeout');
+      if (flushTimeoutMs !== undefined) options.flushTimeoutMs = flushTimeoutMs;
+      return (await volumesFor(context, true)).flush(options);
+    },
+    exitCode: (result) => ((result as FlushResult).flushed ? 0 : 1),
+  },
+  'flush-all': {
+    usage: 'flush-all <vm> [--flush-timeout <ms>]',
+    summary: 'Flush every managed mount in a VM without unmounting.',
+    positionals: ['vm'],
+    options: { 'flush-timeout': { type: 'string' } },
+    run: async (context, [sandboxId]) => {
+      const flushTimeoutMs = integer(context.values, 'flush-timeout');
+      return (await volumesFor(context, true)).flushAll({ sandboxId: sandboxId!, ...(flushTimeoutMs === undefined ? {} : { flushTimeoutMs }) });
+    },
+    exitCode: (result) => ((result as FlushAllResult).flushed ? 0 : 1),
+  },
+  restore: {
+    usage: 'restore <vm>',
+    summary: 'Mount stale mounts again after a stop/start or crash; resumes uploads.',
+    positionals: ['vm'],
+    run: async (context, [sandboxId]) => {
+      const result = await (await volumesFor(context, true)).restoreMounts({ sandboxId: sandboxId! });
+      for (const entry of result.failed) context.stderr(`error: ${entry.mountPath ?? 'unreadable state'}: ${entry.error.code}: ${entry.error.message}\n`);
+      return result;
+    },
+    exitCode: (result) => ((result as RestoreMountsResult).failed.length > 0 ? 1 : 0),
+  },
+  discard: {
+    usage: 'discard <vm> <mountPath> --confirm <mountPath>',
+    summary: 'Delete cache and state a forced detach kept; loses unflushed writes.',
+    positionals: ['vm', 'mountPath'],
+    options: { confirm: { type: 'string' } },
+    run: async (context, [sandboxId, mountPath]) => {
+      if (context.values.confirm !== mountPath) throw new UsageError(`Refusing to discard ${mountPath}: repeat the path with --confirm ${mountPath}. Writes that never reached the bucket are lost.`);
+      return (await volumesFor(context, true)).discardMount({ sandboxId: sandboxId!, mountPath: mountPath!, confirm: mountPath! });
     },
   },
   mounts: {
@@ -240,6 +336,12 @@ const ENVIRONMENT = `Environment:
   VOLUMES_S3_PROVIDER           rclone hint: AWS, Cloudflare, Minio, Ceph, Other
   VOLUMES_S3_FORCE_PATH_STYLE   true or false; default true with an endpoint
   VOLUMES_S3_SESSION_TOKEN      for temporary credentials
+  VOLUMES_S3_SANDBOX_ACCESS_KEY_ID      separate, narrower keys for rclone in
+  VOLUMES_S3_SANDBOX_SECRET_ACCESS_KEY  each VM (default: the keys above)
+  VOLUMES_S3_SANDBOX_SESSION_TOKEN
+  VOLUMES_S3_SSE                AES256 or aws:kms server-side encryption
+  VOLUMES_S3_SSE_KMS_KEY_ID     KMS key for aws:kms
+  VOLUMES_S3_STORAGE_CLASS      storage class for volume data, e.g. STANDARD_IA
   FREESTYLE_API_KEY             for every command that takes a VM`;
 
 function helpText(version: string): string {
@@ -371,6 +473,8 @@ async function volumesFor(context: Context, needsSandbox = false): Promise<Frees
   else if (needsSandbox) sandboxes = freestyleSandboxes(await freestyleClient(context));
   else sandboxes = { get: () => Promise.reject(new UsageError('This command does not use a sandbox.')) };
   const options: ConstructorParameters<typeof FreestyleVolumes>[0] = { storage, sandboxes };
+  const sandboxCredentials = sandboxCredentialsFromEnv(context.env);
+  if (sandboxCredentials) options.sandboxCredentials = sandboxCredentials;
   if (context.io.objectStore) options.objectStore = context.io.objectStore;
   if (context.values.quiet !== true) {
     options.onEvent = (event) => {

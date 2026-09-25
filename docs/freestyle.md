@@ -2,7 +2,7 @@
 
 ## Current verification status
 
-Pre-release run for 0.2.0 — **2026-09-25**: `pnpm test`: 146 passed, 0 skipped; `pnpm check:types`, `pnpm check:examples` and `pnpm test:package` passed; `VOLUMES_TEST_BOOTSTRAP=1 pnpm test:integration`: 33 passed, 0 failed, 0 skipped on Docker. Live on Freestyle the same day (`freestyle/ubuntu-sm`, Ubuntu 24.04.5, x86_64) against Cloudflare R2: all four live tests passed, covering the runtime, the two-VM storage round trip, a volume-ready snapshot with a volume attached from it, and a mount with a pending upload surviving pause and resume. Details and timings are below and in [the evidence](evidence/v0.2.md#live-freestyle-run--2026-09-25). Neither the Docker results nor the local host clone/list benchmark is Freestyle runtime evidence. See [verification](evidence/v0.2.md) (earlier runs in [v0.1](evidence/v0.1.md)), [performance](performance.md) and [source-linked research](freestyle-research.md).
+Live on Freestyle on **2026-09-25** (`freestyle/ubuntu-sm`, Ubuntu 24.04.5, x86_64) against Cloudflare R2: all four live tests of that day passed, covering the runtime, the two-VM storage round trip, a volume-ready snapshot with a volume attached from it, and a mount with a pending upload surviving pause and resume. The stop/start and throughput tests were added afterwards and have not run live yet. Details and timings are below; test counts for every tier are in [the verification record](evidence/v0.2.md) (earlier runs in [v0.1](evidence/v0.1.md)). Neither the Docker results nor the local host clone/list benchmark is Freestyle runtime evidence. See also [performance](performance.md) and [source-linked research](freestyle-research.md).
 
 ## Facts taken from Freestyle's documentation and SDK (`freestyle@0.2.14`)
 
@@ -36,9 +36,10 @@ On `freestyle/ubuntu-sm` (Ubuntu 24.04.5 LTS, x86_64, 16 GB disk), storage on Cl
 
 ## Not yet verified on Freestyle
 
-1. **Stop and start.** A stopped VM boots fresh, so its mounts become `stale` and follow the documented recovery (reattach, then detach). That path is covered in Docker, not live on Freestyle.
+1. **Stop and start.** A stopped VM boots fresh, so its mounts become `stale`; `restoreMounts({ sandboxId })` mounts them again with their saved options and resumes pending uploads. That is covered in Docker. `test/freestyle/stop-start.test.mjs` powers a VM off with an upload pending and requires the restore to bring both back, but it has not run live yet.
 2. **Other sizes, images and CPUs.** Only `freestyle/ubuntu-sm` on x86_64 has been exercised live.
-3. **Throughput.** Large files and sustained transfer rates have not been measured on Freestyle.
+3. **Throughput.** `test/freestyle/throughput.test.mjs` measures large and small writes, uploads and cold reads (opt-in with `VOLUMES_TEST_THROUGHPUT=1`); it has not run yet.
+4. **Scoped sandbox credentials on R2.** Prefix-limited keys are proven against MinIO in Docker, not yet against R2 or AWS S3 live.
 
 ## Volume-ready snapshots
 
@@ -52,9 +53,9 @@ No storage credentials exist at any point of the build, so none can be captured.
 
 ## Running the live test
 
-The live tests are billed to your Freestyle account. `test/freestyle/runtime.test.mjs` needs only `FREESTYLE_API_KEY`: it boots one VM, runs the first-attach bootstrap and checks FUSE plus processes and mounts that outlive their exec. The others need a bucket you control. `test/freestyle/pause.test.mjs` pauses and resumes a VM with an upload pending. `test/freestyle/live.test.mjs` creates two `freestyle/ubuntu-sm` VMs, runs the round trip, and deletes them and the volume. `test/freestyle/snapshot.test.mjs` runs only with `VOLUMES_TEST_PREPARE_SNAPSHOT=1`: it builds a volume-ready snapshot, boots a VM from it, checks that the runtime is preinstalled, round-trips a file, and deletes the VM, the snapshot and the volume.
+The live tests are billed to your Freestyle account. `test/freestyle/runtime.test.mjs` needs only `FREESTYLE_API_KEY`: it boots one VM, runs the first-attach bootstrap and checks FUSE plus processes and mounts that outlive their exec. The others need a bucket you control. `test/freestyle/pause.test.mjs` pauses and resumes a VM with an upload pending. `test/freestyle/live.test.mjs` creates two `freestyle/ubuntu-sm` VMs, runs the round trip, and deletes them and the volume. `test/freestyle/snapshot.test.mjs` runs only with `VOLUMES_TEST_PREPARE_SNAPSHOT=1`: it builds a volume-ready snapshot, boots a VM from it, checks that the runtime is preinstalled, round-trips a file, and deletes the VM, the snapshot and the volume. `test/freestyle/stop-start.test.mjs` powers a VM off with an upload pending, starts it again and requires `restoreMounts` to bring the mount and the upload back. `test/freestyle/throughput.test.mjs` runs only with `VOLUMES_TEST_THROUGHPUT=1`: it writes a large file (256 MB by default) and 1,000 small ones, flushes, and reads back cold, printing the rates as JSON.
 
-The easiest way to run both is the manual **Freestyle live test** workflow (`.github/workflows/freestyle-live.yml`): add the repository secrets `FREESTYLE_API_KEY`, `VOLUMES_S3_ACCESS_KEY_ID` and `VOLUMES_S3_SECRET_ACCESS_KEY` and the variable `VOLUMES_S3_BUCKET` (plus `VOLUMES_S3_ENDPOINT`, `VOLUMES_S3_REGION` and `VOLUMES_S3_PROVIDER` for R2 or MinIO), then start it from the Actions tab. Each run uses its own bucket prefix. Locally:
+The easiest way to run them is the **Freestyle live test** workflow (`.github/workflows/freestyle-live.yml`), which also runs every Monday once the repository has the secrets: add the repository secrets `FREESTYLE_API_KEY`, `VOLUMES_S3_ACCESS_KEY_ID` and `VOLUMES_S3_SECRET_ACCESS_KEY` and the variable `VOLUMES_S3_BUCKET` (plus `VOLUMES_S3_ENDPOINT`, `VOLUMES_S3_REGION` and `VOLUMES_S3_PROVIDER` for R2 or MinIO), then start it from the Actions tab. Each run uses its own bucket prefix. Locally:
 
 ```bash
 export FREESTYLE_API_KEY=...            # freestyle tokens create "volumes-test"
@@ -74,6 +75,8 @@ The tests print every `onEvent` line and delete what they created in `finally` b
 
 - Run `checkSandbox({ sandboxId })` (CLI: `freestyle-volumes doctor --vm <vm-id>`) whenever you change the base snapshot or the firewall. It tests the VM's own path to the bucket with your credentials, which a check from your machine cannot prove.
 - Attach with `uid: 1000, gid: 1000` so the `ubuntu` user owns files; the mount is `allow_other` either way.
+- Give VMs keys limited to their volume with `sandboxCredentials` rather than your process's own key; see the README's scoped credentials section.
+- After a VM stop/start (or a crash), call `restoreMounts({ sandboxId })` once exec works again. For a checkpoint without unmounting, `flush({ sandboxId, mountPath })` uploads every closed file.
 - Keep `detachAll({ sandboxId })` in your VM shutdown path and delete the VM only when it returns `flushed: true`; it detaches every managed mount, including ones your code lost track of, and reports each failure instead of stopping at the first. Normal detach unmounts externally, waits for FUSE serving to stop, drains the VFS retained by `rclone rcd`, then stops the process. Deleting a VM with pending uploads loses them. `listMounts({ sandboxId })` shows what is mounted, stale or unmanaged at any time.
 - After `FLUSH_FAILED`, the filesystem may already be unmounted while the uploader/cache/state remain: restore storage access and retry detach. Forced uncertain detach retains cache/state and the advisory attachment record; it is not a durability guarantee.
 - Reattach recovery requires the same full storage and mount identity. Legacy state without ownership evidence or using old cache ids is not automatically migrated and can require operator intervention. Guest lifecycle locks and symlink rejection do not replace application orchestration of distributed attach/delete races.

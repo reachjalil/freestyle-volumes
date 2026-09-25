@@ -19,6 +19,8 @@ Freestyle VMs are full Linux machines with snapshots and forks, but a VM's disk 
 - **Honest durability.** `detach()` returns `flushed: true` only after every pending upload has reached the bucket.
 - **Fast attach.** Bake the mount runtime into a Freestyle snapshot once, and VMs booted from it skip the install on first attach.
 - **Safe shutdown and preflight.** `detachAll()` drains every mount before a VM is deleted or snapshotted, and `freestyle-volumes doctor` checks your bucket and VMs before the first attach.
+- **Scoped VM keys.** `sandboxCredentials` gives each mount its own key, limited to that volume and read-only for read-only mounts, while your process keeps its own key.
+- **Operations built in.** `flush()` checkpoints a live mount, `restoreMounts()` brings mounts back after a VM stop/start, exclusive leases keep a volume to one writer, and `reconcile()` finds what failed operations left behind.
 - **Nothing extra to run.** The bucket is the only durable store. No metadata server, no daemon on your side.
 
 Community project. Not affiliated with or endorsed by [Freestyle](https://www.freestyle.sh) or [Daytona](https://www.daytona.io). "Daytona-style" describes the developer experience (named volumes, `mountPath`, `subpath`, shared across sandboxes), not API compatibility or identical filesystem semantics.
@@ -97,6 +99,35 @@ This is the setup the live tests ran on. R2 enforces the conditional creates tha
 
 For AWS S3, omit the endpoint and set `region`. For MinIO, set the endpoint and `provider: 'Minio'`; the integration suite runs against it. For other providers, run `doctor` first: it fails if the provider does not reject a duplicate conditional create.
 
+## Scoped credentials for VMs
+
+By default the rclone process in each VM gets the same key as your process, and anything with root in the VM can read it from that process's environment. Give VMs narrower keys instead; your process keeps `storage`'s key for volume records.
+
+- **Fixed keys**, for example one limited to this namespace: `sandboxCredentials: { accessKeyId, secretAccessKey }`. The CLI reads them from `VOLUMES_S3_SANDBOX_ACCESS_KEY_ID` and `VOLUMES_S3_SANDBOX_SECRET_ACCESS_KEY`.
+- **A key per mount:** pass a function. Every attach calls it with the scope to cover (`keyPrefix` is the volume's data prefix plus subpath, and `readOnly` says whether writes are needed) and uses the keys it returns. `scopedPolicy(scope)` builds the matching IAM policy:
+
+```ts
+import { STSClient, AssumeRoleCommand } from '@aws-sdk/client-sts';
+import { FreestyleVolumes, freestyleSandboxes, scopedPolicy } from 'freestyle-volumes';
+
+const sts = new STSClient({ region: 'us-east-1' });
+const volumes = new FreestyleVolumes({
+  storage,
+  sandboxes: freestyleSandboxes(freestyle),
+  sandboxCredentials: async (scope) => {
+    const { Credentials } = await sts.send(new AssumeRoleCommand({
+      RoleArn: 'arn:aws:iam::123456789012:role/volume-mounts', // a role that may use the bucket
+      RoleSessionName: `volume-${scope.volumeId ?? 'check'}`,
+      Policy: JSON.stringify(scopedPolicy(scope)),            // this session: one prefix only
+      DurationSeconds: 12 * 3600,
+    }));
+    return { accessKeyId: Credentials!.AccessKeyId!, secretAccessKey: Credentials!.SecretAccessKey!, sessionToken: Credentials!.SessionToken, expiresAt: Credentials!.Expiration };
+  },
+});
+```
+
+On MinIO, a user whose policy is the `scopedPolicy()` document works the same way; the integration suite proves that such a key mounts its volume and cannot write to any other. On Cloudflare R2, use a token per bucket, or R2's temporary credentials limited to the prefix. rclone cannot refresh keys inside a running mount: `expiresAt` is recorded with the mount and shown by `inspectMount` and `listMounts`, attach warns when it is less than 15 minutes away, and a mount must be detached, or reattached with fresh keys, before then. With `sandboxCredentials` set, mounts skip rclone's HEAD request on the mount root (`no_head_object`), which a key limited to the prefix may not make.
+
 ## Fast attach with a volume-ready snapshot
 
 Install the runtime once and snapshot it:
@@ -134,15 +165,21 @@ npx freestyle-volumes delete datasets --confirm datasets
 
 | Command | What it does |
 | :--- | :--- |
-| `list`, `get <volume>`, `attachments <volume>` | Read volumes and their advisory attachment records. |
+| `list [--skip-invalid]`, `get <volume>`, `attachments <volume>` | Read volumes and their advisory attachment records. |
 | `create <volume> [--label k=v]... [--if-not-exists]` | Create a volume. |
 | `clone <source> <volume> [--label k=v]... [--concurrency n] [--allow-live-source]` | Server-side copy of a quiesced volume. |
 | `delete <volume> --confirm <volume> [--force]` | Delete a volume and all of its data. |
-| `attach <vm> <volume> <mountPath> [--read-only] [--subpath dir] [--uid n] [--gid n] ...` | Mount a volume. [Mount options](#mount-options) are flags such as `--cache-mode full` or `--write-back 10`; see `--help`. |
+| `attach <vm> <volume> <mountPath> [--read-only] [--exclusive] [--subpath dir] [--uid n] [--gid n] ...` | Mount a volume. [Mount options](#mount-options) are flags such as `--cache-mode full` or `--write-back 10`; see `--help`. |
 | `inspect <vm> <mountPath>` | `mounted`, `stale`, `absent` or `unmanaged`, with the upload queue and log tail. |
 | `detach <vm> <mountPath> [--flush-timeout ms] [--force]` | Unmount after verifying the drain. |
 | `mounts <vm>` | Every mount this library manages in the VM, healthy or stale, plus rclone mounts it did not create. |
 | `detach-all <vm> [--flush-timeout ms] [--force]` | Detach every managed mount; exits 1 if any could not be detached. Use it before deleting a VM. |
+| `flush <vm> <mountPath>`, `flush-all <vm>` | Upload every closed file and keep the mount; exits 1 while uploads are still pending. |
+| `restore <vm>` | Mount again every stale mount in a VM, after a stop/start or a crash, resuming pending uploads. |
+| `discard <vm> <mountPath> --confirm <mountPath>` | Delete the cache and state a forced detach kept. Writes that never reached the bucket are lost. |
+| `usage <volume>` | Objects and bytes stored for a volume. |
+| `lease <volume>`, `release-lease <volume> --confirm <volume>` | Show or release the exclusive-writer lease. |
+| `reconcile [--remove-stale]`, `remove-orphan <volume> <generation> --confirm <volume>/<generation>` | Find leftovers of failed clones and interrupted deletes; remove stale records or one orphaned generation. |
 | `doctor [--vm <vm>]` | [Preflight](#preflight-with-doctor) the bucket and optionally a VM; exits 1 if any check fails. |
 | `prepare-snapshot [--base id] [--slug slug] [--name label]` | Build a [volume-ready snapshot](#fast-attach-with-a-volume-ready-snapshot). |
 
@@ -184,7 +221,7 @@ const { flushed } = await volumes.detachAll({ sandboxId: vmId });
 if (flushed) await vm.delete(); // otherwise keep the VM: its cache still holds unuploaded writes
 ```
 
-Read-only inputs cannot be damaged by a run, and each run's `subpath` keeps its outputs apart from every other run in one volume. The complete version is [examples/agent-run.ts](examples/agent-run.ts).
+Read-only inputs cannot be damaged by a run, and each run's `subpath` keeps its outputs apart from every other run in one volume. The complete version is [examples/agent-run.ts](examples/agent-run.ts). `createVmWithVolumes(freestyle, volumes, { vm, mounts })` creates the VM and attaches both mounts in one call. For long runs, `volumes.flush({ sandboxId: vmId, mountPath: '/home/ubuntu/out' })` uploads finished artifacts without unmounting, and after an unplanned stop/start, `volumes.restoreMounts({ sandboxId: vmId })` puts the mounts back.
 
 To seed a volume without a VM, write straight into its data prefix with any S3 tool; mounts see new files after their directory cache (`dirCacheSeconds`) expires:
 
@@ -225,20 +262,27 @@ The volume methods return promises and throw `VolumeError` subclasses with a sta
 
 | Method | What it does |
 | :--- | :--- |
-| `new FreestyleVolumes({ storage, sandboxes, defaults?, onEvent? })` | Validates configuration. `storage` is the bucket; `sandboxes` is `freestyleSandboxes(freestyle)` or `dockerSandboxes()`. |
+| `new FreestyleVolumes({ storage, sandboxes, defaults?, sandboxCredentials?, onEvent? })` | Validates configuration. `storage` is the bucket; `sandboxes` is `freestyleSandboxes(freestyle)` or `dockerSandboxes()`; [`sandboxCredentials`](#scoped-credentials-for-vms) gives VMs narrower keys. |
 | `create({ name, labels?, ifNotExists? })` | Atomically creates the volume record only if absent. Concurrent losers get `VOLUME_ALREADY_EXISTS`, or the winner's record with `ifNotExists`. Names are 1-63 chars of `[a-z0-9-]`; the name is the id. |
 | `get(name, { create? })` | Fetch, or create when missing (Daytona's `volume.get(name, true)`). |
-| `list({ concurrency? }?)` | Volumes in this namespace, sorted by name; metadata-read concurrency defaults to 8 (integer 1–64). Not a snapshot of concurrent changes. |
+| `list({ concurrency?, skipInvalid?, onInvalid? }?)` | Volumes in this namespace, sorted by name; metadata-read concurrency defaults to 8 (integer 1–64). With `skipInvalid`, a malformed record is skipped and reported instead of failing the listing. Not a snapshot of concurrent changes. |
+| `usage(name)` | `{ objects, bytes, directoryMarkers }` stored under the volume's data prefix, from one listing. |
 | `clone({ sourceVolumeId, name, labels?, allowLiveSource?, concurrency?, maxObjects?, maxManifestBytes? })` | Server-side copies within this bucket/namespace, then atomic conditional publication of a new volume. Returns `{ volume, operationId, copiedObjects, copiedBytes }`. Caller must quiesce the source; not a snapshot or COW fork. |
-| `attach({ sandboxId, volumeId, mountPath, readOnly?, subpath?, ...mountOptions })` | Checks the bucket, prepares the runtime, starts the mount and waits until it answers a directory listing. A healthy matching mount returns `alreadyAttached: true`. Stale mounts or existing processes require explicit detach; failed attach retains recovery state and cache. |
+| `attach({ sandboxId, volumeId, mountPath, readOnly?, subpath?, exclusive?, ...mountOptions })` | Checks the bucket, prepares the runtime, starts the mount and waits until it answers a directory listing. A healthy matching mount returns `alreadyAttached: true`. Stale mounts or existing processes require explicit detach; failed attach retains recovery state and cache. With `exclusive: true` it takes the volume's writer lease: other writable attaches are refused until a flushed detach, while read-only attaches stay allowed. The result includes `cacheFreeBytes` and warns when the VM disk is nearly full. |
 | `inspectMount({ sandboxId, mountPath })` | `status` is `mounted`, `stale` (process or mount gone, cache may hold unflushed writes), `absent`, or `unmanaged` (an rclone mount this library did not create), plus pid, upload queue counts, cache size and the log tail. |
 | `detach({ sandboxId, mountPath, flushTimeoutMs?, force? })` | Unmounts first, waits for FUSE serving to stop, drains the retained VFS, then stops the process. Removes cache/state and the advisory attachment record only after a verified drain. Uncertain forced detach retains them and returns `flushed: false`. Never deletes volume data. |
-| `delete({ volumeId, confirm, force? })` | Destroys the record and every object under the volume's data prefix. `confirm` must equal `volumeId`. Refuses while attachment records exist unless `force`. |
-| `listMounts({ sandboxId })` | Every mount this library manages in the sandbox (`mounted` or `stale`, with volume, subpath, mode and pid) plus `unmanaged` rclone mounts. A point-in-time view; takes no locks. |
+| `delete({ volumeId, confirm, force? })` | Destroys the record and every object under the volume's data prefix. `confirm` must equal `volumeId`. Refuses while attachment records or a writer lease exist unless `force`. A deleting marker written first makes attaches refuse (`VOLUME_DELETING`) until the delete finishes; run it again if it was interrupted. |
+| `flush({ sandboxId, mountPath, flushTimeoutMs? })`, `flushAll({ sandboxId })` | Upload every file closed before the call and keep the mount: a checkpoint. `flushed: true` when zero uploads are queued, in flight or failing; files still open are not covered. |
+| `restoreMounts({ sandboxId })` | Mounts every stale managed mount again with the options it was attached with, after a VM stop/start or a crash. Pending uploads in the retained cache resume. |
+| `discardMount({ sandboxId, mountPath, confirm })` | Deletes the cache and state a forced or failed detach kept, and the records they guarded. Loses unflushed writes, so `confirm` repeats the path. |
+| `getLease(volumeId)`, `releaseLease({ volumeId, confirm })` | Show or release the exclusive-writer lease, for example when its VM was deleted. |
+| `reconcile()`, `removeStaleRecords()`, `removeOrphanGeneration({ volumeId, generation, confirm, minAgeSeconds? })` | Survey leftovers (unpublished clone generations, interrupted deletes, stale leases and attachment records, doctor probes); delete records that point at nothing, or one orphaned generation whose clone started more than a day ago. |
+| `listMounts({ sandboxId })` | Every mount this library manages in the sandbox (`mounted` or `stale`, with volume, subpath, mode, pid, upload queue and cache size) plus `unmanaged` rclone mounts. Takes no locks, so it also shows progress while a detach or flush runs. |
 | `detachAll({ sandboxId, flushTimeoutMs?, force? })` | Detaches every managed mount in turn. Never throws for one mount: failures are listed in `results` with their recovery data retained, and `flushed` is true only when nothing unflushed is left. Unmanaged mounts are left alone. |
 | `checkStorage()` | Preflight of the bucket from this process, including whether the provider enforces conditional creates. Returns `{ ok, checks }`; never throws for a failed check. |
 | `checkSandbox({ sandboxId, timeoutMs? })` | Read-only preflight inside a sandbox: runtime, FUSE, whether it can list the bucket with these credentials, cache disk. Returns `{ ok, checks }` with a hint for each warning or failure. |
 | `createVolumeReadySnapshot(freestyle, { baseSnapshotId?, slug?, displayName?, firewall?, bootstrapTimeoutMs?, builderTtlSeconds?, onEvent? })` | Builds a Freestyle snapshot with the mount runtime preinstalled. Returns `{ snapshotId, slug, builderVmId, runtime, warnings }`. |
+| `createVmWithVolumes(freestyle, volumes, { vm, mounts, deleteOnFailure? })` | Creates a VM and attaches volumes to it, like Daytona's `create({ volumes })`. If an attach fails, it detaches what was attached and deletes the VM unless that would lose unflushed writes. |
 
 ### Storage configuration
 
@@ -257,16 +301,18 @@ The volume methods return promises and throw `VolumeError` subclasses with a sta
 | `requestTimeoutMs` | `15000` | Per-request timeout for host-side storage calls, including each multipart stage; not a whole-clone deadline. |
 | `multipartCopyThresholdBytes` | 5 GiB | Integer bytes, 5 MiB–5 GiB. Single copy at or below this threshold; multipart above it. |
 | `multipartCopyPartSizeBytes` | 128 MiB | Integer bytes, 5 MiB–5 GiB. Adaptively increased to keep at most 10,000 parts; final part may be smaller. |
+| `serverSideEncryption`, `sseKmsKeyId` | bucket default | `AES256` or `aws:kms` (with an optional KMS key) on every object this library and rclone write, for buckets whose policy requires the header. Leave unset on Cloudflare R2, which always encrypts. |
+| `storageClass` | bucket default | Storage class for volume data (rclone uploads and clone copies), such as `STANDARD_IA`. Small records keep the default. |
 
 ### Mount options
 
-Defaults: `cacheMode` (`writes`), `writeBackSeconds` (5), `dirCacheSeconds` (60), `allowOther` (true), `uid`/`gid`/`umask` (unset), `cacheMaxSize` (unbounded), `readyTimeoutMs` (30000), `flushTimeoutMs` (60000), `bootstrapTimeoutMs` (240000), `inspectTimeoutMs` (30000). Set them in the constructor's `defaults`; per-attach overrides exclude the flush and inspect timeouts. Freestyle caps one exec at five minutes, and every guest step stays under it.
+Defaults: `cacheMode` (`writes`), `writeBackSeconds` (5), `dirCacheSeconds` (60), `allowOther` (true), `uid`/`gid`/`umask` (unset), `cacheMaxSize` (unbounded), `cacheMinFreeSpace` (`'1G'`: evict clean cached files when the VM disk runs low), `readyTimeoutMs` (30000), `flushTimeoutMs` (60000), `bootstrapTimeoutMs` (240000), `inspectTimeoutMs` (30000). Set them in the constructor's `defaults`; per-attach overrides exclude the flush and inspect timeouts. Freestyle caps one exec at five minutes, and every guest step stays under it.
 
-Optional `bufferSize`, `readAhead`, `readChunkSize`, `readChunkSizeLimit` and `transfers` leave rclone defaults unchanged when omitted. The four sizes require explicit units (such as `'0B'`, `'16M'`, `'1GiB'`); only `readChunkSizeLimit` also accepts `'off'`. `transfers` is an integer 1–64. `readAhead` is effective only with `cacheMode: 'full'` and does not enable it. Existing mounts are not retuned by idempotent attach. See [validation, tradeoffs and examples](docs/performance.md).
+Optional `bufferSize`, `readAhead`, `readChunkSize`, `readChunkSizeLimit` and `transfers` leave rclone defaults unchanged when omitted. Every size requires explicit units (such as `'0B'`, `'16M'`, `'1GiB'`), because rclone reads a bare number as KiB; `cacheMaxSize`, `cacheMinFreeSpace` and `readChunkSizeLimit` also accept `'off'`. `transfers` is an integer 1–64. `readAhead` is effective only with `cacheMode: 'full'` and does not enable it. Existing mounts are not retuned by idempotent attach. See [validation, tradeoffs and examples](docs/performance.md).
 
 ### Errors
 
-Codes: `VALIDATION`, `VOLUME_NOT_FOUND`, `VOLUME_ALREADY_EXISTS`, `VOLUME_IN_USE`, `CONFIRMATION_REQUIRED`, `STORAGE_AUTH`, `STORAGE_UNREACHABLE`, `BUCKET_NOT_FOUND`, `STORAGE_ERROR`, `SANDBOX_EXEC`, `SANDBOX_EXEC_TIMEOUT`, `FUSE_UNAVAILABLE`, `RUNTIME_INSTALL`, `MOUNT_FAILED`, `MOUNT_TIMEOUT`, `MOUNT_PATH_IN_USE`, `MOUNT_STALE`, `MOUNT_BUSY`, `MOUNT_UNMANAGED`, `FLUSH_FAILED`, `UNSUPPORTED`. Each error carries a `hint` with the next step and `details` (log tail, mount path, sandbox id). Messages never contain credentials.
+Codes: `VALIDATION`, `VOLUME_NOT_FOUND`, `VOLUME_ALREADY_EXISTS`, `VOLUME_IN_USE`, `VOLUME_DELETING`, `CONFIRMATION_REQUIRED`, `STORAGE_AUTH`, `STORAGE_UNREACHABLE`, `BUCKET_NOT_FOUND`, `STORAGE_ERROR`, `SANDBOX_EXEC`, `SANDBOX_EXEC_TIMEOUT`, `FUSE_UNAVAILABLE`, `RUNTIME_INSTALL`, `MOUNT_FAILED`, `MOUNT_TIMEOUT`, `MOUNT_PATH_IN_USE`, `MOUNT_STALE`, `MOUNT_BUSY`, `MOUNT_UNMANAGED`, `MOUNT_NOT_FOUND`, `FLUSH_FAILED`, `UNSUPPORTED`. Each error carries a `hint` with the next step and `details` (log tail, mount path, sandbox id). Messages never contain credentials.
 
 ```ts
 import { isVolumeError } from 'freestyle-volumes';
@@ -310,7 +356,7 @@ Use credential-free HTTPS URLs or GitHub `owner/name`; tokens travel only via ex
 | `daytona.volume.get('name', true)` | `volumes.get('name', { create: true })` | Same. |
 | `daytona.volume.list()` | `volumes.list()` | Scoped to the `prefix` namespace. |
 | `daytona.volume.delete(volume)` | `volumes.delete({ volumeId, confirm: volumeId })` | Explicit confirmation; refuses while attachments are recorded. |
-| `daytona.create({ volumes: [{ volumeId, mountPath, subpath }] })` | `volumes.attach({ sandboxId, volumeId, mountPath, subpath })` | Mounted after the VM exists, not at creation. Adds `readOnly`. |
+| `daytona.create({ volumes: [{ volumeId, mountPath, subpath }] })` | `createVmWithVolumes(freestyle, volumes, { vm, mounts: [{ volumeId, mountPath, subpath }] })` | Creates the VM, then attaches; cleans up if an attach fails. Adds `readOnly` and `exclusive`. |
 | implicit unmount on sandbox delete | `volumes.detach(...)` | Detach explicitly to get a durability answer (`flushed`). |
 | `volume.state` (`pending`, `ready`, ...) | none | A created volume is immediately usable. |
 | `daytona volume ...` CLI | `freestyle-volumes ...` CLI | Same verbs, JSON output. |
@@ -323,9 +369,9 @@ Details and the failure matrix live in [docs/semantics.md](docs/semantics.md).
 
 **When is a write durable?** A file is durable in the bucket only after it has been closed and rclone's upload completed. `detach()` normally unmounts, waits for FUSE serving to stop, then expedites and drains the VFS retained by `rclone rcd`. It returns `flushed: true` only after verified zero queued, in-flight and errored uploads and process cleanup. `FLUSH_FAILED` can mean the filesystem is already unmounted while the uploader, state and cache remain: restore storage access and retry detach, optionally with a larger `flushTimeoutMs`. A forced uncertain detach makes no durability claim and retains cache, recovery state and the advisory attachment record.
 
-**Crashes and restarts.** `stale` can mean a crashed mount or an unmounted uploader awaiting drain. Retry detach when the uploader is still running. If drain cannot be verified, an explicit forced detach may stop the identified process while retaining recovery data. Reattach with the same storage identity, volume, subpath and mount path to reuse that cache, then detach normally. Freestyle pause/resume behavior has not been validated.
+**Crashes and restarts.** `stale` can mean a crashed mount or an unmounted uploader awaiting drain. Retry detach when the uploader is still running. If drain cannot be verified, an explicit forced detach may stop the identified process while retaining recovery data. Reattach with the same storage identity, volume, subpath and mount path to reuse that cache, then detach normally; `restoreMounts({ sandboxId })` does this for every stale mount in a VM, with the options each was attached with. On Freestyle, pause and resume keep mounts and their pending uploads (verified live); a stop/start loses the mounts but not their cache, so restore them after the VM boots. `discardMount` deletes retained state on purpose, losing its unflushed writes.
 
-**Concurrent access.** Several VMs may mount one volume. There are no distributed locks or single-writer enforcement: uploads are whole objects, the last upload of a path wins, and visibility depends on directory caches (`dirCacheSeconds`). Use `readOnly` on every VM but one, or separate `subpath`s. Guest `flock` serializes attach/inspect/detach at one mount path; atomic creation protects only volume-record creation. Attachment records are advisory and do not close distributed attach/delete or create/delete races; applications must orchestrate those.
+**Concurrent access.** Several VMs may mount one volume. Uploads are whole objects, the last upload of a path wins, and visibility depends on directory caches (`dirCacheSeconds`). Use `readOnly` on every VM but one, separate `subpath`s, or `exclusive: true` on the writer: its lease is taken with a conditional create, so two exclusive writers can never hold it at once, and plain writable attaches are refused while it is held. The lease only binds attaches that go through this library; a writer that attached before it was taken, or a client writing to the bucket directly, is not stopped. Guest `flock` serializes attach/inspect/detach/flush at one mount path. Attachment records stay advisory, and a deleting marker makes attaches refuse once a delete has started; applications still orchestrate anything beyond that.
 
 **Clone publication, not snapshots.** `clone` HEAD-validates source size and ETag, pins a version when available, copies to an isolated generation, then conditionally publishes the destination record. At or below the configured threshold (default 5 GiB) it uses single copy; larger objects use multipart copy up to a conservative **5 TiB per object**. Source attachment checks are advisory: coordinate writers and verified drain yourself; `allowLiveSource` only bypasses that check. Selection caps are 100,000 objects and 32 MiB of UTF-8 JSON metadata. Unknown completion or publication retains data, and ownership intents are retained with no automatic GC or resume. See the [API, permissions and constants](docs/performance.md#clone-api), [reconciliation](docs/semantics.md#clone-publication-and-reconciliation) and [example](examples/clone.ts).
 
@@ -337,7 +383,7 @@ Details and the failure matrix live in [docs/semantics.md](docs/semantics.md).
 
 | Environment | Supported | Notes |
 | :--- | :--- | :--- |
-| Freestyle `freestyle/ubuntu*` (Ubuntu 24.04) | Yes | Verified live on `freestyle/ubuntu-sm` (x86_64) with Cloudflare R2 on 2026-09-25: storage round trip across two VMs, volume-ready snapshots, pause and resume. Other sizes and arm64 have not been run live. |
+| Freestyle `freestyle/ubuntu*` (Ubuntu 24.04) | Yes | Verified live on `freestyle/ubuntu-sm` (x86_64) with Cloudflare R2 on 2026-09-25: storage round trip across two VMs, volume-ready snapshots, pause and resume. The stop/start and throughput live tests exist but have not run yet; other sizes and arm64 have not been run live. |
 | Freestyle `freestyle/busybox` | No | No package manager for `fuse3`; attach fails with `RUNTIME_INSTALL`. |
 | Docker container | Yes | Needs `--device /dev/fuse --cap-add SYS_ADMIN` (and `--security-opt apparmor:unconfined` where AppArmor is enforced). Verified in CI and locally. |
 | gVisor / containers without `/dev/fuse` | No | `FUSE_UNAVAILABLE`, detected before anything is installed. |
@@ -349,9 +395,10 @@ Details and the failure matrix live in [docs/semantics.md](docs/semantics.md).
 | Rename | Copy then delete; not atomic; slow for large files or trees. |
 | Locks, hard links, inotify | Not supported across VMs. `flock` only matters inside one VM. |
 | Visibility across VMs | Delayed by `dirCacheSeconds` and by each VM's open file handles. |
-| Write cache lives on the VM disk | `cacheMaxSize` is an eviction target, not a hard quota; keep headroom for dirty and open files. `freestyle/ubuntu-sm` has a 16 GB disk. |
+| Write cache lives on the VM disk | Clean cached files are evicted when free space drops below `cacheMinFreeSpace` (1G by default), and attach warns when less than 2 GiB is free, but files waiting to upload are never evicted: writing into the mount faster than the bucket accepts can still fill the disk (16 GB on `freestyle/ubuntu-sm`). Seed large datasets straight into the bucket instead. |
 | Versioned buckets | `delete` removes current versions only. |
-| Credentials in the VM | Present in the rclone process environment while attached (readable by root). Detach before snapshotting. |
+| Quotas | Not enforced: an object-store mount cannot cap how much a VM writes. Watch `usage(name)` and use bucket-level limits or alerts. |
+| Credentials in the VM | Present in the rclone process environment while attached (readable by root). Use [`sandboxCredentials`](#scoped-credentials-for-vms) to limit what they reach, and detach before snapshotting. |
 | Exec cap | Freestyle limits one exec to 300 s; timeouts are bounded accordingly. |
 
 ## Why rclone, and what about JuiceFS
@@ -374,16 +421,16 @@ Preview (`0.x`): the API can change between minor versions, and each change is l
 
 | Tier | What it proves | Latest result (0.2.0, 2026-09-25) |
 | :--- | :--- | :--- |
-| Unit tests (mocked VM, in-memory store, guest scripts run in a local shell) | Validation, script generation, error mapping, registry, clone, Git checks, CLI, snapshot helper, mount listing, preflight checks | `pnpm test`: 146 passed, 0 skipped. SDK and example type checks passed. |
+| Unit tests (mocked VM, in-memory store, guest scripts run in a local shell) | Validation, script generation, error mapping, registry, clone, Git checks, CLI, snapshot helper, mount listing, preflight checks, sandbox credentials, leases, flush, restore, discard, reconcile | `pnpm test`: 180 passed, 0 skipped. SDK and example type checks passed. |
 | Package smoke test | The packed tarball installs and works: ESM and `require()`, the CLI bin, TypeScript under nodenext, bundler and node10 | `pnpm test:package`: passed. |
-| Linux integration (Docker + MinIO, real rclone FUSE) | Lifecycle, isolation, failure recovery, post-unmount drain, `detachAll` with crashed and unmanaged mounts, preflight checks, Git on FUSE, the CLI end to end, bare Ubuntu bootstrap, minimum and pinned rclone | `VOLUMES_TEST_BOOTSTRAP=1 pnpm test:integration`: 33 passed, 0 skipped (local Docker, linux/arm64). CI runs the same suite on linux/amd64. |
-| Freestyle live (real VMs and Cloudflare R2, billed) | The runtime, the two-VM storage round trip, a volume-ready snapshot, pause and resume with an upload pending, and both preflights | `pnpm test:freestyle`: 4 passed on `freestyle/ubuntu-sm`, twice. Bootstrap 15 s on a fresh VM, attach 1.3–1.5 s from a volume-ready snapshot, and pause and resume each under a second with the mount and its pending upload intact. Rerun with the manual [Freestyle live test](.github/workflows/freestyle-live.yml) workflow. |
+| Linux integration (Docker + MinIO, real rclone FUSE) | Lifecycle, isolation, failure recovery, post-unmount drain, `detachAll` with crashed and unmanaged mounts, preflight checks, Git on FUSE, the CLI end to end, bare Ubuntu bootstrap, minimum and pinned rclone, flush, prefix-scoped keys under a real IAM policy, restore after a crash or reboot, discard, exclusive leases | `VOLUMES_TEST_BOOTSTRAP=1 pnpm test:integration`: 38 passed, 1 skipped (the opt-in live GitHub test), on local Docker (linux/arm64). CI runs the same suite on linux/amd64. |
+| Freestyle live (real VMs and Cloudflare R2, billed) | The runtime, the two-VM storage round trip, a volume-ready snapshot, pause and resume with an upload pending, and both preflights | `pnpm test:freestyle`: 4 passed on `freestyle/ubuntu-sm`, twice. Bootstrap 15 s on a fresh VM, attach 1.3–1.5 s from a volume-ready snapshot, and pause and resume each under a second with the mount and its pending upload intact. The stop/start and throughput tests were added after that run and have not run yet. Rerun with the [Freestyle live test](.github/workflows/freestyle-live.yml) workflow. |
 
-Docker results and live Freestyle results are reported separately: the Docker suite covers failure modes that are hard to provoke on a real VM (crashes, flush failures, busy mounts), and the live suite proves the happy paths on Freestyle and R2. Not yet run live: stop/start recovery, other VM sizes and arm64, throughput. Multipart copy is verified with a small real fixture plus mocked large-size boundaries, not an actual 5 TiB copy; Git with local smart HTTP on real FUSE, not live authenticated GitHub. Details and history: [docs/evidence](docs/evidence/v0.2.md).
+Docker results and live Freestyle results are reported separately: the Docker suite covers failure modes that are hard to provoke on a real VM (crashes, flush failures, busy mounts), and the live suite proves the happy paths on Freestyle and R2. Not yet run live: stop/start recovery, throughput, prefix-scoped keys on R2 or AWS, other VM sizes and arm64. Multipart copy is verified with a small real fixture plus mocked large-size boundaries, not an actual 5 TiB copy; Git with local smart HTTP on real FUSE, with a live GitHub test that is opt-in and has not run yet. Details and history: [docs/evidence](docs/evidence/v0.2.md).
 
 ## Security notes
 
-- Storage credentials and Git tokens travel to the VM as environment variables on a root exec, never embedded in command arguments, config or helper files. Root can read process environments; detach mounts before snapshotting and avoid snapshots during credentialed Git operations.
+- Storage credentials and Git tokens travel to the VM as environment variables on a root exec, never embedded in command arguments, config or helper files. Root can read process environments, so give VMs [scoped credentials](#scoped-credentials-for-vms) limited to their volume, detach mounts before snapshotting, and avoid snapshots during credentialed Git operations.
 - Every value that reaches a shell script is validated against a strict character set and single-quoted. Mount paths cannot contain `..`, empty segments, spaces or quotes, and cannot target `/`, `/etc`, `/proc`, `/usr` and similar directories. Guest lifecycle operations also reject symlinked mount paths and ancestors before locking or touching state.
 - Volumes are isolated by prefix. A subpath mount roots the FUSE filesystem at the subpath, so `..` cannot reach a sibling tenant.
 - Nothing destructive happens implicitly: detach keeps data, delete needs `confirm`, and buckets are never created, formatted or emptied outside a confirmed delete.
@@ -395,7 +442,7 @@ pnpm install
 pnpm test                # unit tests (no network, no Docker)
 pnpm test:integration    # Docker + MinIO, real FUSE mounts; VOLUMES_TEST_BOOTSTRAP=1 adds the bare-Ubuntu bootstrap test
 pnpm test:package        # pack, install into a fresh project, import, run the CLI, type-check
-pnpm test:freestyle      # real Freestyle VMs (billed); needs FREESTYLE_API_KEY and VOLUMES_S3_*
+pnpm test:freestyle      # real Freestyle VMs (billed); needs FREESTYLE_API_KEY and VOLUMES_S3_*; VOLUMES_TEST_THROUGHPUT=1 adds the benchmark
 pnpm check:types         # the real `freestyle` SDK satisfies the adapter's structural types
 pnpm check:examples      # type-check the examples
 ```

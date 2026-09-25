@@ -11,6 +11,7 @@ import { ValidationError } from './errors.js';
 import { RcloneBackend, type RuntimeInfo } from './rclone.js';
 import type { SandboxExecInput, SandboxExecResult, SandboxResolver, SandboxRuntime } from './sandbox.js';
 import { assertInteger } from './validate.js';
+import type { AttachVolumeOptions, FreestyleVolumes, VolumeAttachment } from './volumes.js';
 
 export interface FreestyleExecOptions {
   command: string;
@@ -225,4 +226,60 @@ export async function createVolumeReadySnapshot(freestyle: FreestyleSnapshotClie
     }
   }
   return result;
+}
+
+/** One mount for {@link createVmWithVolumes}: attach options without the VM id. */
+export type VolumeMountSpec = Omit<AttachVolumeOptions, 'sandboxId'>;
+
+export interface CreateVmWithVolumesOptions<O> {
+  /** Passed to `freestyle.vms.create`. Include a firewall rule that lets the VM reach the bucket. */
+  vm: O;
+  /** Attached in order once the VM exists. */
+  mounts: VolumeMountSpec[];
+  /**
+   * When an attach fails: detach what was attached and delete the VM if nothing
+   * unflushed is left in it (default true). A VM with unflushed writes is kept.
+   */
+  deleteOnFailure?: boolean;
+}
+
+export interface VmWithVolumes<V> {
+  vm: V;
+  vmId: string;
+  attachments: VolumeAttachment[];
+}
+
+/**
+ * Create a VM and attach volumes to it, like Daytona's `create({ volumes })`.
+ * Boot from a volume-ready snapshot to skip the install on each attach. If an
+ * attach fails, the mounts made so far are detached and the VM is deleted
+ * (unless that would lose unflushed writes), then the error is rethrown.
+ *
+ * @example
+ * const { vm, vmId } = await createVmWithVolumes(freestyle, volumes, {
+ *   vm: { snapshotId: 'ubuntu-sm-volumes', firewall },
+ *   mounts: [{ volumeId: 'datasets', mountPath: '/home/ubuntu/data', readOnly: true }],
+ * });
+ */
+export async function createVmWithVolumes<O extends FreestyleCreateVmOptionsLike, V extends { delete(): Promise<void> }>(
+  freestyle: { vms: { create(options: O): Promise<{ vm: V; vmId: string }> } },
+  volumes: Pick<FreestyleVolumes, 'attach' | 'detachAll'>,
+  options: CreateVmWithVolumesOptions<O>,
+): Promise<VmWithVolumes<V>> {
+  if (!options || typeof options !== 'object' || !Array.isArray(options.mounts)) {
+    throw new ValidationError('createVmWithVolumes needs { vm, mounts: [...] }.');
+  }
+  const { vm, vmId } = await freestyle.vms.create(options.vm);
+  const attachments: VolumeAttachment[] = [];
+  try {
+    for (const mount of options.mounts) attachments.push(await volumes.attach({ ...mount, sandboxId: vmId }));
+    return { vm, vmId, attachments };
+  } catch (error) {
+    if (options.deleteOnFailure !== false) {
+      // Also covers a failed attach whose mount came up late: detach it before deleting the VM.
+      const cleanup = await volumes.detachAll({ sandboxId: vmId }).catch(() => ({ flushed: false }));
+      if (cleanup.flushed) await vm.delete().catch(() => undefined);
+    }
+    throw error;
+  }
 }

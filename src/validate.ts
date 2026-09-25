@@ -9,7 +9,6 @@ const SEGMENT = /^[A-Za-z0-9_][A-Za-z0-9._-]{0,127}$/;
 const MOUNT_PATH_CHARS = /^[A-Za-z0-9._/-]+$/;
 const BUCKET = /^[a-z0-9](?:[a-z0-9.-]{1,61}[a-z0-9])$/;
 const SANDBOX_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
-const CACHE_SIZE = /^[0-9]{1,6}[KMGT]?$/;
 const UMASK = /^0?[0-7]{3}$/;
 
 /** Mount targets that would shadow or damage the guest OS, or this library's own state. */
@@ -117,11 +116,18 @@ export function assertInteger(name: string, value: unknown, min: number, max: nu
   return value;
 }
 
-export function assertCacheSize(value: unknown): string {
-  if (typeof value !== 'string' || !CACHE_SIZE.test(value)) {
-    throw new ValidationError(`cacheMaxSize ${JSON.stringify(value)} must look like "10G", "500M" or "1024" (MiB).`);
+/**
+ * A cache size limit (`cacheMaxSize`, `cacheMinFreeSpace`): an rclone size with
+ * explicit units, or "off". A bare number is refused because rclone reads it as
+ * KiB, so "1024" would silently mean 1 MiB.
+ */
+export function assertCacheSize(value: unknown, name = 'cacheMaxSize'): string {
+  if (typeof value === 'string' && /^[0-9]+(?:\.[0-9]+)?$/.test(value)) {
+    throw new ValidationError(`${name} ${JSON.stringify(value)} needs a unit such as "M" or "G": rclone reads a bare number as KiB, so it would mean ${value} KiB.`, {
+      hint: 'Write sizes like "500M", "10G" or "1GiB", or "off" for no limit.',
+    });
   }
-  return value;
+  return assertRcloneSize(name, value, true);
 }
 
 /** rclone sizes with explicit units; bare numbers otherwise mean KiB, not bytes. */

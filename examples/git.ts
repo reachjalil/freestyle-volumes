@@ -1,6 +1,5 @@
-import type { FreestyleVolumes } from '../src/volumes.js';
-import type { SandboxResolver } from '../src/sandbox.js';
-import { volumeGit, type GitLocation } from '../src/git.js';
+import type { FreestyleVolumes, SandboxResolver } from 'freestyle-volumes';
+import { volumeGit, type GitLocation } from 'freestyle-volumes/git';
 
 /**
  * Not a distributed lock or an ACID S3 transaction. The caller must stop every

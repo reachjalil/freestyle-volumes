@@ -54,6 +54,8 @@ export interface MountSpec {
   gid?: number;
   umask?: string;
   cacheMaxSize?: string;
+  /** Evict clean cached files when free disk under the cache drops below this; rclone SizeSuffix or "off". */
+  cacheMinFreeSpace?: string;
   /** rclone SizeSuffix (e.g. "16M" or "16777216B"); per-open-file memory buffer. */
   bufferSize?: string;
   /** Extra disk read-ahead in full cache mode; rclone SizeSuffix. */
@@ -143,6 +145,8 @@ export interface GuestMountResult {
   pid: number;
   /** Reused mounts retain their existing options; requested tuning was not applied. */
   alreadyAttached: boolean;
+  /** Free bytes on the filesystem that holds the write cache, when the guest could tell. */
+  cacheFreeBytes: number | null;
 }
 
 export interface GuestMountInspection {
@@ -216,6 +220,8 @@ fsvol_lock() {
   flock -n 8 || { echo 'FSVOL_ERR lifecycle-busy'; exit 36; }
 }
 fsvol_now() { cut -d. -f1 /proc/uptime; }
+# Free KiB on the filesystem holding a path (the write cache), or nothing when unknown.
+fsvol_free_kb() { d="$1"; while [ ! -d "$d" ] && [ "$d" != / ]; do d=\${d%/*}; [ -n "$d" ] || d=/; done; df -Pk "$d" 2>/dev/null | awk 'NR == 2 && $4 ~ /^[0-9]+$/ { print $4 }'; }
 `;
 }
 
@@ -283,6 +289,7 @@ export function mountFlags(spec: MountSpec): string {
     '--poll-interval', '0',
   ];
   if (spec.cacheMaxSize !== undefined) flags.push('--vfs-cache-max-size', spec.cacheMaxSize);
+  if (spec.cacheMinFreeSpace !== undefined) flags.push('--vfs-cache-min-free-space', spec.cacheMinFreeSpace);
   if (spec.bufferSize !== undefined) flags.push('--buffer-size', spec.bufferSize);
   if (spec.readAhead !== undefined) flags.push('--vfs-read-ahead', spec.readAhead);
   if (spec.readChunkSize !== undefined) flags.push('--vfs-read-chunk-size', spec.readChunkSize);
@@ -316,6 +323,7 @@ export function mountScript(paths: GuestPaths, spec: MountSpec): string {
     ...(spec.uid === undefined ? {} : { UID: spec.uid }), ...(spec.gid === undefined ? {} : { GID: spec.gid }),
     ...(spec.umask === undefined ? {} : { Umask: parseInt(spec.umask, 8) }),
     ...(spec.cacheMaxSize === undefined ? {} : { CacheMaxSize: spec.cacheMaxSize }),
+    ...(spec.cacheMinFreeSpace === undefined ? {} : { CacheMinFreeSpace: spec.cacheMinFreeSpace }),
     ...(spec.readAhead === undefined ? {} : { ReadAhead: spec.readAhead }),
     ...(spec.readChunkSize === undefined ? {} : { ChunkSize: spec.readChunkSize }),
     ...(spec.readChunkSizeLimit === undefined ? {} : { ChunkSizeLimit: spec.readChunkSizeLimit }),
@@ -343,7 +351,7 @@ if fsvol_mounted "$MP"; then
   if [ "\${src#*:}" != "\${REMOTE#*:}" ]; then echo "FSVOL_ERR path-in-use $src"; exit 20; fi
   if [ "$alive" = 1 ] && timeout ${readySeconds} stat "$MP" >/dev/null 2>&1; then
     if [ "$(fsvol_mount_ro "$MP")" != "$RO" ]; then echo "FSVOL_ERR path-in-use read-only-mismatch"; exit 20; fi
-    echo "FSVOL_RESULT status=attached already=1 pid=$pid"; exit 0
+    echo "FSVOL_RESULT status=attached already=1 pid=$pid cachefree=$(fsvol_free_kb "$CACHE")"; exit 0
   fi
   echo "FSVOL_ERR path-in-use stale-mount-requires-detach"; exit 20
 fi
@@ -388,7 +396,7 @@ while [ "$(fsvol_now)" -lt "$deadline" ]; do
     fi
   fi
   remaining=$((deadline - $(fsvol_now))); [ "$remaining" -gt 0 ] || break
-  if fsvol_owned "$pid" && fsvol_mounted "$MP" && timeout "$remaining" ls "$MP" >/dev/null 2>&1; then echo "FSVOL_RESULT status=attached already=0 pid=$pid"; exit 0; fi
+  if fsvol_owned "$pid" && fsvol_mounted "$MP" && timeout "$remaining" ls "$MP" >/dev/null 2>&1; then echo "FSVOL_RESULT status=attached already=0 pid=$pid cachefree=$(fsvol_free_kb "$CACHE")"; exit 0; fi
   sleep 0.25
 done
 echo "FSVOL_ERR ready-timeout"; fsvol_log_tail "$LOG"
@@ -417,6 +425,18 @@ exit 0
 `;
 }
 
+/**
+ * Shell helpers shared by detach and flush: `rc` calls the mount's own rclone
+ * RC socket until `$deadline` (only while the verified process owns it), `num`
+ * reads one integer counter from `vfs/stats`, and `expedite` makes every queued
+ * upload start now instead of after the write-back delay.
+ */
+function drainFunctions(): string {
+  return `rc() { remaining=$((deadline - $(fsvol_now))); [ "$remaining" -gt 0 ] && fsvol_owned "$pid" && [ -n "$RC" ] && [ -S "$SOCK" ] && timeout "$remaining" "$RC" rc --unix-socket "$SOCK" "$@" 2>/dev/null; }
+num() { sed -n "s/^[[:space:]]*\\"$1\\": *\\([0-9][0-9]*\\)[,[:space:]]*$/\\1/p" | head -n 1; }
+expedite() { qout=$(rc vfs/queue) || return 0; for id in $(echo "$qout" | sed -n 's/^[[:space:]]*"id": *\\([0-9][0-9]*\\).*/\\1/p'); do rc vfs/queue-set-expiry "id=$id" expiry=0 >/dev/null 2>&1; done; }`;
+}
+
 export function detachScript(paths: GuestPaths, options: { mountPath: string; flushTimeoutMs: number; force: boolean }): string {
   const flushSeconds = Math.max(1, Math.ceil(options.flushTimeoutMs / 1000));
   return `${prelude(paths)}
@@ -440,9 +460,7 @@ pid=""; [ -f "$SD/pid" ] && pid=$(cat "$SD/pid" 2>/dev/null)
 alive=0; fsvol_owned "$pid" && alive=1
 ro="$rostate"; [ "$mounted" = 1 ] && ro=$(fsvol_mount_ro "$MP")
 deadline=$(($(fsvol_now) + FLUSH))
-rc() { remaining=$((deadline - $(fsvol_now))); [ "$remaining" -gt 0 ] && fsvol_owned "$pid" && [ -n "$RC" ] && [ -S "$SOCK" ] && timeout "$remaining" "$RC" rc --unix-socket "$SOCK" "$@" 2>/dev/null; }
-num() { sed -n "s/^[[:space:]]*\\"$1\\": *\\([0-9][0-9]*\\)[,[:space:]]*$/\\1/p" | head -n 1; }
-expedite() { qout=$(rc vfs/queue) || return 0; for id in $(echo "$qout" | sed -n 's/^[[:space:]]*"id": *\\([0-9][0-9]*\\).*/\\1/p'); do rc vfs/queue-set-expiry "id=$id" expiry=0 >/dev/null 2>&1; done; }
+${drainFunctions()}
 stop_process() {
   case "$pid" in ''|*[!0-9]*|0|1) [ -f "$SD/stopped" ]; return $?;; esac
   if fsvol_owned "$pid"; then
@@ -504,12 +522,82 @@ echo "FSVOL_ERR flush-timeout pending=$pending errored=$errored"; fsvol_log_tail
 }
 
 /**
+ * Upload every file that was closed before the call while the mount stays up:
+ * expedite the queue, then wait until rclone reports zero queued, in-flight and
+ * errored uploads. Holds the mount-path lock, so it cannot race a detach.
+ * Files still open for writing are not queued yet and are not covered.
+ */
+export function flushScript(paths: GuestPaths, options: { mountPath: string; flushTimeoutMs: number }): string {
+  const flushSeconds = Math.max(1, Math.ceil(options.flushTimeoutMs / 1000));
+  return `${prelude(paths)}
+MP=${q(options.mountPath)}
+fsvol_lock
+FLUSH=${flushSeconds}
+RC=$(fsvol_rclone) || RC=""
+SD=$(fsvol_find_state "$MP")
+if [ -z "$SD" ]; then
+  if fsvol_mounted "$MP"; then echo "FSVOL_ERR unmanaged $(fsvol_mount_source "$MP")"; exit 34; fi
+  echo 'FSVOL_ERR absent'; exit 33
+fi
+MID=$(basename "$SD"); SOCK="$RUN_ROOT/$MID.sock"; LOG="$SD/rclone.log"
+vol=$(sed -n 's/.*"volumeId":"\\([^"]*\\)".*/\\1/p' "$SD/mount.json" 2>/dev/null)
+pid=""; [ -f "$SD/pid" ] && pid=$(cat "$SD/pid" 2>/dev/null)
+if ! fsvol_owned "$pid" || [ -z "$RC" ] || [ ! -S "$SOCK" ]; then echo 'FSVOL_ERR stale uploader-not-running'; exit 32; fi
+mounted=0; fsvol_mounted "$MP" && mounted=1
+deadline=$(($(fsvol_now) + FLUSH))
+${drainFunctions()}
+pending=-1; errored=-1
+while [ "$(fsvol_now)" -lt "$deadline" ]; do
+  expedite
+  s=$(rc vfs/stats) || s=""
+  qd=$(echo "$s" | num uploadsQueued); ip=$(echo "$s" | num uploadsInProgress); er=$(echo "$s" | num erroredFiles)
+  pending=-1; errored=-1
+  if [ -n "$qd" ] && [ -n "$ip" ] && [ -n "$er" ]; then
+    pending=$((qd + ip)); errored=$er
+    if [ "$pending" -eq 0 ] && [ "$errored" -eq 0 ]; then echo "FSVOL_RESULT status=flushed pending=0 errored=0 mounted=$mounted mid=$MID volume=$vol"; exit 0; fi
+  fi
+  sleep 0.25
+done
+echo "FSVOL_RESULT status=pending pending=$pending errored=$errored mounted=$mounted mid=$MID volume=$vol"; fsvol_log_tail "$LOG"; exit 0
+`;
+}
+
+/**
+ * Delete the recovery state and write cache kept for a mount path after a
+ * forced or failed detach. Destroys any writes that never reached the bucket,
+ * so it refuses while the mount exists or its uploader still runs.
+ */
+export function discardScript(paths: GuestPaths, options: { mountPath: string }): string {
+  return `${prelude(paths)}
+MP=${q(options.mountPath)}
+fsvol_lock
+SD=$(fsvol_find_state "$MP")
+if [ -z "$SD" ]; then
+  if fsvol_mounted "$MP"; then echo "FSVOL_ERR unmanaged $(fsvol_mount_source "$MP")"; exit 34; fi
+  echo 'FSVOL_RESULT status=absent'; exit 0
+fi
+MID=$(basename "$SD"); SOCK="$RUN_ROOT/$MID.sock"; CACHE="$CACHE_ROOT/$MID"
+if fsvol_mounted "$MP"; then echo 'FSVOL_ERR path-in-use still-mounted'; exit 20; fi
+pid=""; [ -f "$SD/pid" ] && pid=$(cat "$SD/pid" 2>/dev/null)
+if fsvol_owned "$pid"; then echo 'FSVOL_ERR path-in-use uploader-running'; exit 20; fi
+# Without an identity record a live PID could still be the uploader: fail closed.
+if fsvol_pid_alive "$pid" && { [ ! -s "$SD/pid.start" ] || [ ! -s "$SD/pid.exe" ]; }; then echo 'FSVOL_ERR path-in-use process-identity-missing'; exit 20; fi
+vol=$(sed -n 's/.*"volumeId":"\\([^"]*\\)".*/\\1/p' "$SD/mount.json" 2>/dev/null)
+kb=$(du -sk "$CACHE" 2>/dev/null | awk '{ print $1 }')
+rm -rf "$CACHE" "$SD" "$SOCK" || { echo 'FSVOL_ERR cleanup-failed'; exit 35; }
+echo "FSVOL_RESULT status=discarded volume=$vol mid=$MID cachekb=$kb"
+`;
+}
+
+/**
  * Read-only listing of every managed mount state (healthy or not) and every
  * rclone mount without one. Takes no locks, so it is a point-in-time view.
  */
 export function listMountsScript(paths: GuestPaths): string {
   return `${prelude(paths)}
+RC=$(fsvol_rclone) || RC=""
 fsvol_rclone_mounts() { awk '$3 == "fuse.rclone" { print $2 }' /proc/mounts 2>/dev/null; }
+fsvol_vfs_stats() { [ -n "$RC" ] && [ -S "$1" ] && timeout 10 "$RC" rc --unix-socket "$1" vfs/stats 2>/dev/null | tr -d '\\n'; }
 # List managed mounts: one state directory each, whatever its process is doing.
 for f in "$STATE_ROOT"/mounts/*/mount.json; do
   [ -f "$f" ] || continue
@@ -521,6 +609,8 @@ for f in "$STATE_ROOT"/mounts/*/mount.json; do
   alive=0; fsvol_owned "$pid" && alive=1
   ro=""; [ "$mounted" = 1 ] && ro=$(fsvol_mount_ro "$mp")
   printf 'FSVOL_MOUNT mid=%s mounted=%s alive=%s pid=%s ro=%s state=%s\\n' "$MID" "$mounted" "$alive" "$pid" "$ro" "$(tr -d '\\n' < "$f")"
+  # Upload queue and cache size of a running uploader, for monitoring.
+  if [ "$alive" = 1 ]; then st=$(fsvol_vfs_stats "$SOCK"); [ -z "$st" ] || printf 'FSVOL_MSTATS mid=%s %s\\n' "$MID" "$st"; fi
 done
 # rclone mounts without a state record were not created by this library.
 fsvol_rclone_mounts | while IFS= read -r m; do
@@ -596,14 +686,21 @@ echo "FSVOL_RESULT status=checked"
 }
 
 export interface GuestMountListing {
-  mounts: Array<{ mountId: string; mounted: boolean; alive: boolean; pid: number | null; readOnly: boolean | null; state: Record<string, unknown> | null }>;
+  mounts: Array<{ mountId: string; mounted: boolean; alive: boolean; pid: number | null; readOnly: boolean | null; state: Record<string, unknown> | null; stats: RcloneVfsStats | null }>;
   unmanaged: string[];
 }
 
 export function parseMountListing(stdout: string): GuestMountListing {
   const listing: GuestMountListing = { mounts: [], unmanaged: [] };
+  const stats = new Map<string, RcloneVfsStats>();
   for (const raw of stdout.split('\n')) {
     const line = raw.replace(/\r$/, '');
+    const mountStats = /^FSVOL_MSTATS mid=([0-9a-f]+) (.*)$/.exec(line);
+    if (mountStats) {
+      const parsed = parseVfsStats([mountStats[2]!]);
+      if (parsed) stats.set(mountStats[1]!, parsed);
+      continue;
+    }
     const mount = /^FSVOL_MOUNT mid=([0-9a-f]+) mounted=([01]) alive=([01]) pid=([0-9]*) ro=([01]?) state=(.*)$/.exec(line);
     if (mount) {
       let state: Record<string, unknown> | null = null;
@@ -620,11 +717,13 @@ export function parseMountListing(stdout: string): GuestMountListing {
         pid: mount[4] ? Number(mount[4]) : null,
         readOnly: mount[5] === '1' ? true : mount[5] === '0' ? false : null,
         state,
+        stats: null,
       });
     } else if (line.startsWith('FSVOL_UNMANAGED ')) {
       listing.unmanaged.push(line.slice('FSVOL_UNMANAGED '.length));
     }
   }
+  for (const mount of listing.mounts) mount.stats = mount.alive ? stats.get(mount.mountId) ?? null : null;
   return listing;
 }
 
@@ -807,12 +906,16 @@ export class RcloneBackend {
     const run = await runGuest(sandbox, { label: 'mount', script: mountScript(this.paths, spec), env, timeoutMs: options.timeoutMs });
     const out = parseGuestOutput(run.stdout);
     if (out.error || run.exitCode !== 0 || !out.result) throw mountError(run, out, sandbox.id, spec);
-    return { pid: toInt(out.result.pid) ?? 0, alreadyAttached: out.result.already === '1' };
+    const freeKb = toInt(out.result.cachefree);
+    return { pid: toInt(out.result.pid) ?? 0, alreadyAttached: out.result.already === '1', cacheFreeBytes: freeKb === null || freeKb < 0 ? null : freeKb * 1024 };
   }
 
   async inspect(sandbox: SandboxRuntime, mountPath: string, options: { timeoutMs: number }): Promise<GuestMountInspection> {
     const run = await runGuest(sandbox, { label: 'inspect', script: inspectScript(this.paths, mountPath), timeoutMs: options.timeoutMs });
     const out = parseGuestOutput(run.stdout);
+    if (out.error?.code === 'lifecycle-busy') {
+      throw new MountError('MOUNT_BUSY', `Another guest lifecycle operation is running at ${mountPath}. Retry when it finishes, or use listMounts, which takes no lock.`, { details: guestFailure(run, out, sandbox.id, { mountPath }) });
+    }
     if (out.error || run.exitCode !== 0 || !out.result) {
       throw new MountError('MOUNT_FAILED', `Inspecting ${mountPath} in sandbox "${sandbox.id}" failed.`, { details: guestFailure(run, out, sandbox.id, { mountPath }) });
     }
@@ -878,5 +981,80 @@ export class RcloneBackend {
       mountId: r.mid ? r.mid : null,
       readOnly: r.ro === '1' ? true : r.ro === '0' ? false : null,
     };
+  }
+
+  async flush(sandbox: SandboxRuntime, options: { mountPath: string; flushTimeoutMs: number; timeoutMs: number }): Promise<GuestFlushResult> {
+    const run = await runGuest(sandbox, { label: 'flush', script: flushScript(this.paths, options), timeoutMs: options.timeoutMs });
+    const out = parseGuestOutput(run.stdout);
+    if (out.error || run.exitCode !== 0 || !out.result) throw lifecycleError('flush', run, out, sandbox.id, options.mountPath);
+    const r = out.result;
+    const pending = toInt(r.pending);
+    const errored = toInt(r.errored);
+    return {
+      flushed: r.status === 'flushed',
+      pending: pending === null || pending < 0 ? null : pending,
+      errored: errored === null || errored < 0 ? null : errored,
+      mounted: r.mounted === '1',
+      mountId: r.mid ? r.mid : null,
+      volumeId: r.volume ? r.volume : null,
+      logTail: out.blocks.LOG ?? [],
+    };
+  }
+
+  async discard(sandbox: SandboxRuntime, options: { mountPath: string; timeoutMs: number }): Promise<GuestDiscardResult> {
+    const run = await runGuest(sandbox, { label: 'discard', script: discardScript(this.paths, options), timeoutMs: options.timeoutMs });
+    const out = parseGuestOutput(run.stdout);
+    if (out.error || run.exitCode !== 0 || !out.result) throw lifecycleError('discard', run, out, sandbox.id, options.mountPath);
+    const r = out.result;
+    if (r.status === 'absent') return { status: 'absent', volumeId: null, mountId: null, cacheBytes: null };
+    const kb = toInt(r.cachekb);
+    return { status: 'discarded', volumeId: r.volume ? r.volume : null, mountId: r.mid ? r.mid : null, cacheBytes: kb === null ? null : kb * 1024 };
+  }
+}
+
+export interface GuestFlushResult {
+  /** True once rclone reported zero queued, in-flight and errored uploads. */
+  flushed: boolean;
+  pending: number | null;
+  errored: number | null;
+  /** False when only the uploader is left (a detach already removed the filesystem). */
+  mounted: boolean;
+  mountId: string | null;
+  volumeId: string | null;
+  logTail: string[];
+}
+
+export interface GuestDiscardResult {
+  status: 'discarded' | 'absent';
+  volumeId: string | null;
+  mountId: string | null;
+  /** Size of the write cache that was deleted, including any writes that never reached the bucket. */
+  cacheBytes: number | null;
+}
+
+/** Error mapping for the flush and discard scripts. */
+function lifecycleError(step: 'flush' | 'discard', run: GuestRun, out: GuestOutput, sandboxId: string, mountPath: string): VolumeError {
+  const code = out.error?.code ?? 'unknown';
+  const detail = out.error?.detail ?? '';
+  const details = guestFailure(run, out, sandboxId, { mountPath });
+  switch (code) {
+    case 'lifecycle-busy':
+      return new MountError('MOUNT_BUSY', `Another guest lifecycle operation is running at ${mountPath}. Retry when it finishes.`, { details });
+    case 'absent':
+      return new MountError('MOUNT_NOT_FOUND', `Nothing this library manages is mounted at ${mountPath} in sandbox "${sandboxId}".`, { hint: 'Check the path with listMounts({ sandboxId }).', details });
+    case 'unmanaged':
+      return new MountError('MOUNT_UNMANAGED', `${mountPath} in sandbox "${sandboxId}" is an rclone mount that freestyle-volumes did not create (${detail}).`, { details });
+    case 'stale':
+      return new MountError('MOUNT_STALE', `The mount at ${mountPath} in sandbox "${sandboxId}" has no running uploader (${detail}); nothing can be flushed until it is reattached.`, {
+        hint: 'Attach the same volume at the same path to resume its pending uploads (restoreMounts does this for every stale mount), then flush or detach.',
+        details,
+      });
+    case 'path-in-use':
+      return new MountError('MOUNT_PATH_IN_USE', `Refusing to discard ${mountPath} in sandbox "${sandboxId}" (${detail}).`, {
+        hint: detail === 'still-mounted' || detail === 'uploader-running' ? 'Detach it first; discard only removes state that a failed or forced detach left behind.' : 'Inspect the process in the sandbox before removing its state by hand.',
+        details,
+      });
+    default:
+      return new MountError('MOUNT_FAILED', `The ${step} step at ${mountPath} in sandbox "${sandboxId}" failed (${code} ${detail}).`.trim(), { details });
   }
 }

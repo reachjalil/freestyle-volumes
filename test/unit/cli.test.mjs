@@ -147,7 +147,7 @@ test('attach passes mount options through, and inspect and detach print the moun
 
   const attached = await cli(['attach', 'vm-1', 'data', '/mnt/data', '--read-only', '--subpath', 'team-a', '--uid', '1000', '--gid', '1000', '--cache-mode', 'full', '--transfers', '4', '--read-chunk-size-limit', 'off'], io);
   assert.equal(attached.code, 0, attached.stderr);
-  assert.deepEqual({ ...attached.json(), mountId: undefined }, { sandboxId: 'vm-1', volumeId: 'data', mountPath: '/mnt/data', subpath: 'team-a', readOnly: true, mountId: undefined, pid: 4242, alreadyAttached: false, warnings: [] });
+  assert.deepEqual({ ...attached.json(), mountId: undefined }, { sandboxId: 'vm-1', volumeId: 'data', mountPath: '/mnt/data', subpath: 'team-a', readOnly: true, exclusive: false, mountId: undefined, pid: 4242, alreadyAttached: false, cacheFreeBytes: null, credentialsExpireAt: null, warnings: [] });
   assert.match(attached.stderr, /\[attach\.bootstrap\] vm-1 \/mnt\/data data/);
   assert.match(attached.stderr, /\[attach\.done\] vm-1 \/mnt\/data data \(pid 4242\)/);
   const mount = sandbox.calls[1];

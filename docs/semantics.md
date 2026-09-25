@@ -40,9 +40,11 @@ Storage identity includes resolved host and sandbox endpoints, bucket, namespace
 | `fuse3`/rclone/required tools missing and not installable | Bootstrap fails | `RUNTIME_INSTALL` with the failing step | Use an Ubuntu image, allow HTTPS to downloads.rclone.org, or preinstall rclone ≥ 1.68, fuse3 and required tools including `flock`. |
 | Download checksum mismatch | Archive discarded | `RUNTIME_INSTALL` (`checksum-mismatch`) | Retry; investigate if it persists. |
 | Mount path already used by another volume or a foreign mount | Refused | `MOUNT_PATH_IN_USE` | Detach the other mount or pick another path. |
-| rclone process crashes | Kernel can keep a dead FUSE entry (`Transport endpoint is not connected`); pending files stay in the cache | `inspectMount` → `stale`; normal detach cannot claim a verified drain | Explicit forced detach may remove the stale mount while retaining cache/state. Then reattach with the same full identity and detach normally. Legacy or uncertain identity can require operator recovery. |
-| Sandbox restart (stop/start) | Processes and mounts are gone, disk (cache, state) survives | `stale` | Same as a crash. |
-| Sandbox pause/resume (Freestyle) | Process preservation and rclone reconnection are expected | Unvalidated | No pause/resume behavior has been verified live. |
+| rclone process crashes | Kernel can keep a dead FUSE entry (`Transport endpoint is not connected`); pending files stay in the cache | `inspectMount` → `stale`; normal detach cannot claim a verified drain | `restoreMounts` removes the dead entry with a forced detach that keeps cache and state, then mounts again with the same identity; detach normally afterwards. Legacy or uncertain identity can require operator recovery. |
+| Retained state blocks a path | A forced detach kept cache and state for recovery, so another volume cannot mount at that path | `MOUNT_PATH_IN_USE` (`stale-state`) | Reattach the same volume to recover the writes, or `discardMount({ sandboxId, mountPath, confirm: mountPath })` to delete them for good. |
+| Delete interrupted halfway | The deleting marker stays; some data may already be gone | Attach and clone refuse with `VOLUME_DELETING` | Run `delete` again to finish it. `reconcile` lists interrupted deletes. |
+| Sandbox restart (stop/start) | Processes and mounts are gone, disk (cache, state) survives | `stale` | `restoreMounts({ sandboxId })` mounts each again with its saved options, reusing the cache, then detach normally to upload what was pending. Covered in Docker; the Freestyle live test (`test/freestyle/stop-start.test.mjs`) has not run yet. |
+| Sandbox pause/resume (Freestyle) | Memory and processes are preserved; rclone carries on | `mounted` after resume | Nothing to do. Verified live on 2026-09-25: pause and resume each took under a second, and an upload queued before the pause drained afterwards. |
 | Files open during detach | Normal `fusermount3 -u` can return `EBUSY` | `MOUNT_BUSY`, mount stays | Close the files and retry. Force may lazy-unmount and stop the owned process, retaining uncertain cache/state without promising recovery of every open write. |
 | Endpoint unreachable during detach | Filesystem normally unmounts first; retained uploader retries until timeout | `FLUSH_FAILED`; mount may be gone while uploader/cache/state remain | Restore connectivity and retry detach; force gives up the durability guarantee and retains recovery data. |
 | Another lifecycle operation owns this guest mount-path lock | Attach/inspect/detach refuses lock contention | `lifecycle-busy` guest error | Retry after the operation finishes. This is not a distributed lock. |
@@ -52,7 +54,7 @@ Storage identity includes resolved host and sandbox endpoints, bucket, namespace
 
 ## Concurrent access
 
-- Any number of sandboxes may mount the same volume, read-write or read-only. Nothing enforces a single writer, and this library does not claim to.
+- Any number of sandboxes may mount the same volume, read-write or read-only. Plain writable attaches do not enforce a single writer; `exclusive: true` does, among attaches made through this library (see [Exclusive writers](#exclusive-writers)).
 - Uploads are whole objects. Two sandboxes writing the same path both upload complete files; the later upload wins. There is no merge and no conflict signal.
 - Listings are cached per mount for `dirCacheSeconds` (default 60). A file created by another sandbox shows up after that, or immediately if the path is looked up explicitly and was not cached as missing.
 - An already-open file keeps serving the version it opened.
@@ -61,6 +63,16 @@ Storage identity includes resolved host and sandbox endpoints, bucket, namespace
 - Guest per-path `flock` serializes attach/inspect/detach in one sandbox. Atomic `putObjectIfAbsent` protects volume-record creation only. Neither solves distributed attach/delete or create/delete races; applications must orchestrate them across clients and sandboxes.
 
 Recommended patterns: one writer and many `readOnly` readers, or one `subpath` per sandbox so writers never share paths.
+
+## Exclusive writers
+
+`attach({ exclusive: true })` takes `<prefix>/_leases/<volume>.json` with a conditional create before mounting. While it is held, other writable attaches of the volume are refused with `VOLUME_IN_USE`; read-only attaches stay allowed. Two exclusive attaches can never both hold it, because only one conditional create succeeds. The holder can attach again idempotently, a flushed detach releases it, and an unflushed or forced detach keeps it, like the attachment record, while recoverable writes remain in the VM. `delete` and `clone` refuse while it is held unless forced or `allowLiveSource`. A lease taken on an earlier volume with the same name is ignored and replaced. An unreadable lease fails closed.
+
+The lease binds only attaches made through this library after it was taken: a writable mount that already existed, or anything writing to the bucket directly, is not stopped. When the holder's VM is gone, `releaseLease({ volumeId, confirm: volumeId })` removes it.
+
+## Checkpoints with flush
+
+`flush({ sandboxId, mountPath })` expedites the upload queue and waits until rclone reports zero queued, in-flight and errored uploads, holding the mount-path lock so no detach can interleave. `flushed: true` covers every file closed before the call returned; a file still open for writing is queued only when it is closed. The mount stays up, and new writes after the call need another flush or the final detach. A timeout returns `flushed: false` with the counts left rather than an error.
 
 ## Clone publication and reconciliation
 

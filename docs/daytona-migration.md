@@ -11,7 +11,7 @@
 | `await daytona.volume.get('data', true)` | `await volumes.get('data', { create: true })` |
 | `await daytona.volume.list()` | `await volumes.list()` |
 | `await daytona.volume.delete(volume)` | `await volumes.delete({ volumeId: volume.id, confirm: volume.id })` |
-| `daytona.create({ volumes: [{ volumeId, mountPath: '/home/daytona/data', subpath: 'tenant-1' }] })` | `freestyle.vms.create({...})` then `volumes.attach({ sandboxId: vmId, volumeId, mountPath: '/home/ubuntu/data', subpath: 'tenant-1' })` |
+| `daytona.create({ volumes: [{ volumeId, mountPath: '/home/daytona/data', subpath: 'tenant-1' }] })` | `createVmWithVolumes(freestyle, volumes, { vm: {...}, mounts: [{ volumeId, mountPath: '/home/ubuntu/data', subpath: 'tenant-1' }] })`, or `freestyle.vms.create({...})` then `volumes.attach(...)` |
 | (sandbox deleted → volume detached) | `await volumes.detachAll({ sandboxId })` before deleting the VM; delete it when `flushed` is true |
 | `volume.id` (UUID) and `volume.name` | `volume.id === volume.name` |
 | `volume.state` (`pending`, `ready`, `error`, ...) | not present; a created volume is ready |
@@ -46,7 +46,7 @@ if (flushed) await vm.delete();
 
 ## Differences that matter
 
-1. **Mount after creation, not at creation.** Freestyle's `vms.create` has no volume parameter; `attach` runs once the VM is up. First attach on a fresh VM takes longer (fuse3 install, rclone download) unless the snapshot has them preinstalled: build one with `createVolumeReadySnapshot` (CLI: `freestyle-volumes prepare-snapshot`) and boot VMs from it to skip the bootstrap.
+1. **Mount after creation, not at creation.** Freestyle's `vms.create` has no volume parameter; `attach` runs once the VM is up, and `createVmWithVolumes` wraps both steps, cleaning up if an attach fails. After a stop/start, `restoreMounts` puts the mounts back. First attach on a fresh VM takes longer (fuse3 install, rclone download) unless the snapshot has them preinstalled: build one with `createVolumeReadySnapshot` (CLI: `freestyle-volumes prepare-snapshot`) and boot VMs from it to skip the bootstrap.
 2. **You bring the bucket.** Daytona hosts the object store. Here `storage` is your own S3-compatible bucket and credentials; they are handed to the sandbox as environment variables for the duration of the mount.
 3. **Explicit detach with a durability answer.** Daytona unmounts implicitly. Here normal `detach()` externally unmounts, waits for FUSE serving to stop, drains the retained VFS, then stops the process. Require `flushed: true` before deleting a VM if the last writes matter. `FLUSH_FAILED` may leave the filesystem unmounted with the uploader/cache/state retained: restore storage access and retry detach. Forced uncertain detach retains recovery data and makes no durability claim.
 4. **Read-only mounts** exist (`readOnly: true`). Daytona's API does not expose that.

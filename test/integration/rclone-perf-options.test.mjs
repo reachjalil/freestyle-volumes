@@ -36,7 +36,7 @@ test('real MinIO guest: opt-in tuning accepted on minimum and pinned rclone', { 
         mountId: 'perf1234', remotePath: `fsvol:${stack.bucket}/perf`, mountPath: '/mnt/perf',
         readOnly: false, cacheMode: 'full', writeBackSeconds: 3600, dirCacheSeconds: 60,
         allowOther: false, readyTimeoutMs: 20000,
-        bufferSize: '1048576B', readAhead: '2M', readChunkSize: '1MiB', readChunkSizeLimit: '4M', transfers: 2,
+        bufferSize: '1048576B', readAhead: '2M', readChunkSize: '1MiB', readChunkSizeLimit: '4M', transfers: 2, cacheMinFreeSpace: '3M',
         stateJson: JSON.stringify({ mountId: 'perf1234', mountPath: '/mnt/perf', volumeId: 'perf', readOnly: false }),
       };
       const rc = async endpoint => JSON.parse(await shell(`'${runtime.rclonePath}' rc --unix-socket '${DEFAULT_GUEST_PATHS.runRoot}/${spec.mountId}.sock' ${endpoint}`));
@@ -47,6 +47,7 @@ test('real MinIO guest: opt-in tuning accepted on minimum and pinned rclone', { 
         assert.equal(opt.ReadAhead, 2 * 1024 * 1024);
         assert.equal(opt.ChunkSize, 1024 * 1024);
         assert.equal(opt.ChunkSizeLimit, 4 * 1024 * 1024);
+        assert.equal(opt.CacheMinFreeSpace, 3 * 1024 * 1024, 'the cache free-space guard reaches the VFS');
         const { main } = await rc('options/get');
         assert.equal(main.BufferSize, 1024 * 1024);
         assert.equal(main.Transfers, 2);
@@ -59,7 +60,8 @@ test('real MinIO guest: opt-in tuning accepted on minimum and pinned rclone', { 
         ...spec, bufferSize: '8M', readAhead: '8M', readChunkSize: '8M', readChunkSizeLimit: 'off', transfers: 8,
         stateJson: JSON.stringify({ changed: true }),
       }, env, { timeoutMs: 30000 });
-      assert.deepEqual(reused, { pid: attached.pid, alreadyAttached: true });
+      assert.deepEqual({ pid: reused.pid, alreadyAttached: reused.alreadyAttached }, { pid: attached.pid, alreadyAttached: true });
+      assert.ok(reused.cacheFreeBytes > 0, 'the guest reports free space for the write cache');
       await assertOptions();
       assert.equal(await shell(`cat '${DEFAULT_GUEST_PATHS.stateRoot}/mounts/${spec.mountId}/mount.json'`), before);
       const detached = await backend.unmount(sb, { mountPath: spec.mountPath, flushTimeoutMs: 20000, force: false, timeoutMs: 35000 });

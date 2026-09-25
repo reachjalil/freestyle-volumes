@@ -201,12 +201,12 @@ test('daemon arguments survive both shell layers without interpolation', () => {
 test('reusing a mount reports alreadyAttached and returns before writing new tuning or state', async () => {
   const tuned = { ...spec, cacheMode: 'full', bufferSize: '32M', transfers: 8 };
   const script = mountScript(DEFAULT_GUEST_PATHS, tuned);
-  const reuse = script.indexOf('FSVOL_RESULT status=attached already=1 pid=$pid"; exit 0');
+  const reuse = script.indexOf('FSVOL_RESULT status=attached already=1 pid=$pid cachefree=$(fsvol_free_kb "$CACHE")"; exit 0');
   assert.ok(reuse > 0);
   assert.ok(reuse < script.indexOf('> "$SD/mount.json"'));
   assert.ok(reuse < script.indexOf('\nDAEMON_FLAGS='));
-  const result = await new RcloneBackend().mount(new FakeSandbox('vm-1', [{ stdout: 'FSVOL_RESULT status=attached already=1 pid=17\n' }]), tuned, {}, { timeoutMs: 1000 });
-  assert.deepEqual(result, { pid: 17, alreadyAttached: true });
+  const result = await new RcloneBackend().mount(new FakeSandbox('vm-1', [{ stdout: 'FSVOL_RESULT status=attached already=1 pid=17 cachefree=2048\n' }]), tuned, {}, { timeoutMs: 1000 });
+  assert.deepEqual(result, { pid: 17, alreadyAttached: true, cacheFreeBytes: 2 * 1024 * 1024 });
 });
 
 test('exec timeouts and transport failures become SandboxError', async () => {

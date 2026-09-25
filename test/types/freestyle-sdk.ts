@@ -2,8 +2,10 @@
 // types this library uses. Checked with `pnpm check:types`; never executed.
 import { Freestyle, type FirewallSpec, type Vm } from 'freestyle';
 import {
+  createVmWithVolumes,
   createVolumeReadySnapshot,
   freestyleSandboxes,
+  type FreestyleVolumes,
   type FreestyleClientLike,
   type FreestyleFirewallSpec,
   type FreestyleSnapshotClientLike,
@@ -21,4 +23,11 @@ const firewall: FreestyleFirewallSpec = sdkFirewall;
 const backToSdk: FirewallSpec = firewall;
 const building = createVolumeReadySnapshot(new Freestyle({ apiKey: 'unused' }), { baseSnapshotId: 'freestyle/ubuntu-sm', slug: 'ubuntu-sm-volumes', firewall: sdkFirewall });
 
-export const ok = [client, vm, resolver, snapshotClient, backToSdk, building] as const;
+// createVmWithVolumes takes the real client and SDK create options, and hands back the SDK's Vm.
+declare const volumes: FreestyleVolumes;
+const withVolumes = createVmWithVolumes(new Freestyle({ apiKey: 'unused' }), volumes, {
+  vm: { snapshotId: 'ubuntu-sm-volumes', idleTimeoutSeconds: 600, firewall: sdkFirewall },
+  mounts: [{ volumeId: 'datasets', mountPath: '/home/ubuntu/data', readOnly: true }],
+}).then(({ vm: created }): Vm => created);
+
+export const ok = [client, vm, resolver, snapshotClient, backToSdk, building, withVolumes] as const;
