@@ -18,17 +18,19 @@ const volumes = new FreestyleVolumes({
 
 // VMs must be allowed to reach the storage endpoint (and downloads.rclone.org on first use).
 const firewall: FirewallSpec = { rules: [{ action: 'allow', source: {}, destination: { public: true } }] };
+// A snapshot from examples/prepare-snapshot.ts skips the one-time fuse3 and rclone install.
+const snapshotId = process.env.VOLUMES_VM_SNAPSHOT ?? 'freestyle/ubuntu-sm';
 
 const volume = await volumes.get('datasets', { create: true });
 
-const { vm: first, vmId: firstId } = await freestyle.vms.create({ snapshotId: 'freestyle/ubuntu-sm', firewall });
+const { vm: first, vmId: firstId } = await freestyle.vms.create({ snapshotId, firewall });
 await volumes.attach({ sandboxId: firstId, volumeId: volume.id, mountPath: '/home/ubuntu/datasets', uid: 1000, gid: 1000 });
 await first.exec('echo "trained on $(date)" > /home/ubuntu/datasets/run.log');
 const detached = await volumes.detach({ sandboxId: firstId, mountPath: '/home/ubuntu/datasets' });
 console.log('detached, durable:', detached.flushed); // true only when every pending upload finished
 await first.delete();
 
-const { vm: second, vmId: secondId } = await freestyle.vms.create({ snapshotId: 'freestyle/ubuntu-sm', firewall });
+const { vm: second, vmId: secondId } = await freestyle.vms.create({ snapshotId, firewall });
 await volumes.attach({ sandboxId: secondId, volumeId: volume.id, mountPath: '/home/ubuntu/datasets', readOnly: true });
 console.log((await second.exec('cat /home/ubuntu/datasets/run.log')).stdout);
 await volumes.detach({ sandboxId: secondId, mountPath: '/home/ubuntu/datasets' });

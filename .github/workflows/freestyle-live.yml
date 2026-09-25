@@ -1,0 +1,54 @@
+name: Freestyle live test
+# Manual only. Creates real Freestyle VMs (billed to the account behind
+# FREESTYLE_API_KEY) and writes to a real bucket; everything it creates is
+# deleted at the end. Configure in Settings > Secrets and variables > Actions:
+#   secrets:   FREESTYLE_API_KEY, VOLUMES_S3_ACCESS_KEY_ID, VOLUMES_S3_SECRET_ACCESS_KEY
+#   variables: VOLUMES_S3_BUCKET, and optionally VOLUMES_S3_ENDPOINT,
+#              VOLUMES_S3_REGION, VOLUMES_S3_PROVIDER
+on:
+  workflow_dispatch:
+    inputs:
+      snapshot:
+        description: Also build a volume-ready snapshot and attach from a VM booted from it
+        type: boolean
+        default: true
+permissions:
+  contents: read
+concurrency:
+  group: freestyle-live
+  cancel-in-progress: false
+jobs:
+  live:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      FREESTYLE_API_KEY: ${{ secrets.FREESTYLE_API_KEY }}
+      VOLUMES_S3_ACCESS_KEY_ID: ${{ secrets.VOLUMES_S3_ACCESS_KEY_ID }}
+      VOLUMES_S3_SECRET_ACCESS_KEY: ${{ secrets.VOLUMES_S3_SECRET_ACCESS_KEY }}
+      VOLUMES_S3_BUCKET: ${{ vars.VOLUMES_S3_BUCKET }}
+      VOLUMES_S3_ENDPOINT: ${{ vars.VOLUMES_S3_ENDPOINT }}
+      VOLUMES_S3_REGION: ${{ vars.VOLUMES_S3_REGION }}
+      VOLUMES_S3_PROVIDER: ${{ vars.VOLUMES_S3_PROVIDER }}
+      VOLUMES_S3_PREFIX: freestyle-volumes-live-${{ github.run_id }}
+      VOLUMES_TEST_PREPARE_SNAPSHOT: ${{ inputs.snapshot && '1' || '' }}
+    steps:
+      - name: Check configuration
+        run: |
+          missing=""
+          for name in FREESTYLE_API_KEY VOLUMES_S3_ACCESS_KEY_ID VOLUMES_S3_SECRET_ACCESS_KEY VOLUMES_S3_BUCKET; do
+            [ -n "$(printenv "$name")" ] || missing="$missing $name"
+          done
+          if [ -n "$missing" ]; then
+            echo "::error::Missing repository secrets or variables:$missing"
+            exit 1
+          fi
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10.15.1
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm test:freestyle

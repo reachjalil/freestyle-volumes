@@ -56,8 +56,22 @@ export {
   parseVfsStats,
 } from './rclone.js';
 export type { GuestPaths, CacheMode, MountSpec, GuestOutput, RcloneVfsStats, RuntimeInfo, GuestMountResult, GuestMountInspection, GuestDetachResult, RcloneBackendOptions } from './rclone.js';
-export { FreestyleSandbox, freestyleSandboxes } from './freestyle.js';
-export type { FreestyleVmLike, FreestyleClientLike, FreestyleExecOptions, FreestyleExecResult, FreestyleSandboxOptions } from './freestyle.js';
+export { FreestyleSandbox, freestyleSandboxes, createVolumeReadySnapshot } from './freestyle.js';
+export type {
+  FreestyleVmLike,
+  FreestyleClientLike,
+  FreestyleExecOptions,
+  FreestyleExecResult,
+  FreestyleSandboxOptions,
+  FreestyleFirewallEndpoint,
+  FreestyleFirewallSpec,
+  FreestyleCreateVmOptionsLike,
+  FreestyleSnapshotVmLike,
+  FreestyleSnapshotClientLike,
+  VolumeReadySnapshotOptions,
+  VolumeReadySnapshot,
+  VolumeReadySnapshotEvent,
+} from './freestyle.js';
 export { DockerSandbox, dockerSandboxes } from './docker.js';
 export type { DockerSandboxOptions } from './docker.js';
 export {

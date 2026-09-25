@@ -1,6 +1,18 @@
 # Changelog
 
-## Unreleased
+## 0.2.0 — 2026-09-25
+
+First release on npm (`npm install freestyle-volumes freestyle`). It also ships every change merged to `main` since 0.1.0, listed after the new items.
+
+- **npm package.** Publishable ESM package for Node 22+ with TypeScript types, declaration maps and source. Entry points `freestyle-volumes`, `/freestyle`, `/docker`, `/git` and `/package.json`; types also resolve under TypeScript's legacy `node10` resolution, and `require()` works on Node versions with `require(esm)`. `@aws-sdk/client-s3` is now a caret range rather than an exact pin, so consumers can share one copy. Builds start from a clean `dist/`.
+- **CLI.** New `freestyle-volumes` command: `list`, `get`, `create`, `clone`, `delete`, `attachments`, `attach`, `inspect`, `detach` and `prepare-snapshot`. Configuration comes from `VOLUMES_S3_*` and `FREESTYLE_API_KEY` (or `--env-file`), results print as JSON, progress goes to stderr, and exit codes separate operation failures (1) from usage and configuration errors (2). `--docker` targets a local container. Deleting requires repeating the name with `--confirm`.
+- **Volume-ready snapshots.** New `createVolumeReadySnapshot(freestyle, options)` boots a temporary builder VM, runs the mount bootstrap (fuse3, flock, pinned and checksum-verified rclone), snapshots it and deletes the builder. The builder also gets a TTL as a safety net. VMs booted from the snapshot skip the one-time install on attach. No storage credentials are involved.
+- **Freestyle adapter tests.** `FreestyleSandbox` now has unit tests for user selection, the 300 s exec cap, env forwarding and result mapping; `pnpm check:types` also proves the real SDK (now `freestyle@0.2.14`) satisfies the snapshot helper's structural types.
+- **Release tooling.** `pnpm test:package` packs the tarball, installs it into a fresh project and exercises every entry point, the CLI bin and TypeScript resolution; `npm publish` runs it together with the unit tests and type checks. CI tests Node 22, 24 and 26. A release workflow publishes GitHub releases to npm with provenance (trusted publishing or `NPM_TOKEN`), and a manual workflow runs the billed Freestyle live tests from repository secrets.
+- **Documentation.** README rewritten for npm users (install, quick start, snapshots, CLI); release procedure in [docs/release.md](docs/release.md); verification record in [docs/evidence/v0.2.md](docs/evidence/v0.2.md).
+- **Verification — 2026-09-25.** `pnpm test`: 127 passed, 0 skipped. `pnpm check:types`, `pnpm check:examples` and `pnpm test:package` passed. `VOLUMES_TEST_BOOTSTRAP=1 pnpm test:integration`: 28 passed, 0 failed, 0 skipped on local Docker (linux/arm64), including the CLI end to end. `pnpm test:freestyle`: 2 skipped without credentials; no live Freestyle round trip or snapshot build has run yet.
+
+Changes merged to `main` after 0.1.0, first released in 0.2.0:
 
 - **Detach safety.** Use `rclone rcd` plus RC `mount/mount`: external normal unmount → FUSE serving stopped → retained VFS drained → process stopped. Queue/error counters must be valid and zero before reporting a verified drain.
 - **Recovery.** `FLUSH_FAILED` may leave an unmounted filesystem with uploader, cache and state retained for retry. Failed attach retains recovery evidence. Forced uncertain detach retains state/cache in place and the advisory attachment record; rejected reattach preserves stopped-process evidence. Legacy state without identity metadata or with old cache ids is not automatically migrated and may require operator recovery.

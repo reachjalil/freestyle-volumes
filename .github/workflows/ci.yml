@@ -4,7 +4,12 @@ permissions:
   contents: read
 jobs:
   verify:
+    name: verify (Node ${{ matrix.node }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node: [22, 24, 26]
     steps:
       - uses: actions/checkout@v4
       - uses: pnpm/action-setup@v4
@@ -12,13 +17,14 @@ jobs:
           version: 10.15.1
       - uses: actions/setup-node@v4
         with:
-          node-version: 22
+          node-version: ${{ matrix.node }}
           cache: pnpm
       - run: pnpm install --frozen-lockfile
       - run: pnpm test
       - run: pnpm check:types
       - run: pnpm check:examples
-      - run: pnpm pack
+      # Packs the tarball, installs it into a fresh project and uses it from there.
+      - run: pnpm test:package
   integration:
     # Real rclone FUSE mounts in Docker containers against MinIO. Not Freestyle.
     runs-on: ubuntu-latest
