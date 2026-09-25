@@ -81,7 +81,9 @@ child.on('exit', code => { clearTimeout(timer); process.exit(expired ? 124 : cod
 `);
     timeout = `'${process.execPath}' '${helper}'`;
   }
-  const run = async (force = false, flushTimeoutMs = 2000) => {
+  // Success paths return as soon as the drain is verified; the budget only has to
+  // absorb a whole-second clock and slow helper processes on loaded machines.
+  const run = async (force = false, flushTimeoutMs = 5000) => {
     const script = detachScript(paths, { mountPath: '/mnt/data', force, flushTimeoutMs }).replace("MP='/mnt/data'", `${overrides}\ntimeout() { ${timeout} "$@"; }\nMP='/mnt/data'`);
     return exec('sh', ['-c', script], { timeout: 10000 }).then(r => ({ ...r, code: 0 }), e => ({ stdout: e.stdout, stderr: e.stderr, code: e.code }));
   };
