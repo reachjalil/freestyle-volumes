@@ -1,6 +1,6 @@
 // Build once: a Freestyle snapshot with fuse3 and rclone preinstalled, so VMs
 // booted from it skip the one-time package install on their first attach.
-// Boots a temporary VM (billed for a few minutes), snapshots it and deletes it.
+// Boots a temporary VM (billed for under a minute), snapshots it and deletes it.
 // Run with: FREESTYLE_API_KEY=... npx tsx examples/prepare-snapshot.ts
 import { Freestyle } from 'freestyle';
 import { createVolumeReadySnapshot } from 'freestyle-volumes/freestyle';

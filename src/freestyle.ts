@@ -146,7 +146,7 @@ export interface VolumeReadySnapshotOptions {
   builderTtlSeconds?: number;
   /** Guest paths must match the backend of the `FreestyleVolumes` instance that attaches volumes later. */
   backend?: RcloneBackend;
-  /** Structured progress. Building takes minutes: VM boot, apt, a 30 MB download, then the snapshot. */
+  /** Structured progress: VM boot, apt, a 30 MB download, then the snapshot (22.6 s in total on freestyle/ubuntu-sm in the live test). */
   onEvent?: (event: VolumeReadySnapshotEvent) => void;
 }
 
@@ -166,7 +166,7 @@ const SLUG = /^[a-z0-9](?:[a-z0-9]|-(?=[a-z0-9])){0,62}$/;
 /**
  * Build a Freestyle snapshot with the volume runtime (fuse3, flock and the
  * pinned, checksum-verified rclone) already installed, so VMs booted from it
- * skip the minute or two of installs on their first attach.
+ * skip those installs (15 s on freestyle/ubuntu-sm) on their first attach.
  *
  * Boots a temporary builder VM, runs the same bootstrap `attach` would, takes
  * a snapshot and deletes the builder VM. No storage credentials are involved,

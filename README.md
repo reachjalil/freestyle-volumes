@@ -17,7 +17,7 @@ Freestyle VMs are full Linux machines with snapshots and forks, but a VM's disk 
 
 - **Library and CLI.** A TypeScript API (`create`, `get`, `list`, `clone`, `attach`, `inspect`, `detach`, `delete`) and a `freestyle-volumes` command with the same verbs.
 - **Honest durability.** `detach()` returns `flushed: true` only after every pending upload has reached the bucket.
-- **Fast attach.** Bake the mount runtime into a Freestyle snapshot once, and VMs booted from it skip the minute-or-two install on first attach.
+- **Fast attach.** Bake the mount runtime into a Freestyle snapshot once, and VMs booted from it skip the install on first attach.
 - **Safe shutdown and preflight.** `detachAll()` drains every mount before a VM is deleted or snapshotted, and `freestyle-volumes doctor` checks your bucket and VMs before the first attach.
 - **Nothing extra to run.** The bucket is the only durable store. No metadata server, no daemon on your side.
 
@@ -67,7 +67,7 @@ await volumes.attach({ sandboxId: other.vmId, volumeId: volume.id, mountPath: '/
 console.log((await other.vm.exec('cat /mnt/datasets/hello.txt')).stdout); // hello
 ```
 
-The first attach on a fresh VM installs `fuse3` and a pinned, checksum-verified rclone, which takes a minute or two. [Prepare a snapshot](#fast-attach-with-a-volume-ready-snapshot) to skip that. The complete example is [examples/freestyle.ts](examples/freestyle.ts).
+The first attach on a fresh VM installs `fuse3` and a pinned, checksum-verified rclone; that took 15 s on `freestyle/ubuntu-sm` in the live test. [Prepare a snapshot](#fast-attach-with-a-volume-ready-snapshot) to skip that. The complete example is [examples/freestyle.ts](examples/freestyle.ts).
 
 Freestyle checklist:
 
@@ -317,7 +317,7 @@ Details and the failure matrix live in [docs/semantics.md](docs/semantics.md).
 
 | Environment | Supported | Notes |
 | :--- | :--- | :--- |
-| Freestyle `freestyle/ubuntu*` (Ubuntu 24.04) | Expected | `vm.exec` as root; bootstrap uses apt. Type-checked against the Freestyle SDK; the live test is pending (see [project status](#project-status)). |
+| Freestyle `freestyle/ubuntu*` (Ubuntu 24.04) | Partly verified | Root exec, `/dev/fuse`, mounts that outlive their exec, the 15 s bootstrap and volume-ready snapshots verified live on `freestyle/ubuntu-sm` (2026-09-25). The storage round trip is pending (see [project status](#project-status)). |
 | Freestyle `freestyle/busybox` | No | No package manager for `fuse3`; attach fails with `RUNTIME_INSTALL`. |
 | Docker container | Yes | Needs `--device /dev/fuse --cap-add SYS_ADMIN` (and `--security-opt apparmor:unconfined` where AppArmor is enforced). Verified in CI and locally. |
 | gVisor / containers without `/dev/fuse` | No | `FUSE_UNAVAILABLE`, detected before anything is installed. |
@@ -357,9 +357,9 @@ Preview (`0.x`): the API can change between minor versions, and each change is l
 | Unit tests (mocked VM, in-memory store, guest scripts run in a local shell) | Validation, script generation, error mapping, registry, clone, Git checks, CLI, snapshot helper, mount listing, preflight checks | `pnpm test`: 146 passed, 0 skipped. SDK and example type checks passed. |
 | Package smoke test | The packed tarball installs and works: ESM and `require()`, the CLI bin, TypeScript under nodenext, bundler and node10 | `pnpm test:package`: passed. |
 | Linux integration (Docker + MinIO, real rclone FUSE) | Lifecycle, isolation, failure recovery, post-unmount drain, `detachAll` with crashed and unmanaged mounts, preflight checks, Git on FUSE, the CLI end to end, bare Ubuntu bootstrap, minimum and pinned rclone | `VOLUMES_TEST_BOOTSTRAP=1 pnpm test:integration`: 33 passed, 0 skipped (local Docker, linux/arm64). CI runs the same suite on linux/amd64. |
-| Freestyle live (real VMs, billed) | The round trip and the snapshot build on Freestyle's Ubuntu image | **Not yet run**: 2 skipped without credentials. Needs a Freestyle API key and a bucket: run the manual [Freestyle live test](.github/workflows/freestyle-live.yml) workflow or `pnpm test:freestyle`. |
+| Freestyle live (real VMs, billed) | FUSE, the bootstrap, processes and mounts that outlive their exec, the snapshot build, and the storage round trip | The runtime test passed and `createVolumeReadySnapshot` built a working snapshot on `freestyle/ubuntu-sm`. **The storage round trip is pending** a bucket credential: run the manual [Freestyle live test](.github/workflows/freestyle-live.yml) workflow or `pnpm test:freestyle`. |
 
-Docker results are not Freestyle results: they exercise the mount mechanics on real FUSE, while the Freestyle adapter is checked against the SDK's types until the live test runs. Multipart copy is verified with a small real fixture plus mocked large-size boundaries, not an actual 5 TiB copy; Git with local smart HTTP on real FUSE, not live authenticated GitHub. Details and history: [docs/evidence](docs/evidence/v0.2.md).
+Docker results are not Freestyle results: they exercise the mount mechanics on real FUSE. On Freestyle itself, the runtime and snapshot behavior is verified live, and the storage round trip is still to come. Multipart copy is verified with a small real fixture plus mocked large-size boundaries, not an actual 5 TiB copy; Git with local smart HTTP on real FUSE, not live authenticated GitHub. Details and history: [docs/evidence](docs/evidence/v0.2.md).
 
 ## Security notes
 
