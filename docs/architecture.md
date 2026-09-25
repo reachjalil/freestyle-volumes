@@ -140,3 +140,17 @@ The `fsvol` remote is defined entirely by `RCLONE_CONFIG_FSVOL_*` environment va
 | Flush | 60 s | `flushTimeoutMs` ≤ 260 s; exec limit is `flushTimeoutMs + 40 s` |
 
 Every exec stays within Freestyle's 300 s cap. A timed-out volume-runtime exec (`statusCode === null`) surfaces as `SANDBOX_EXEC_TIMEOUT`; the Git helper instead reports `GIT_TIMEOUT` and requires inspection before retrying.
+
+## Why rclone
+
+This is a shortlist of design tradeoffs for this preview, not an exhaustive or benchmark-ranked comparison. See the [source-linked research](freestyle-research.md) for the boundary between workspaces and artifacts.
+
+| Backend | Kind | License | Random writes | Metadata / extra service | Verdict |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **rclone mount** (chosen) | object-store mount with local write-back cache | MIT | Yes, buffered locally; whole object re-uploaded on close | Object listing only; empty dirs via markers; **no extra service** | Single static binary, S3-compatible endpoint/path-style support, and an RC API used by the verified-drain protocol. Similar category to Daytona's documented volumes. |
+| JuiceFS | POSIX-like distributed filesystem (chunked data in S3) | Apache-2.0 | Yes, chunk-level; atomic rename, locks, xattr | **Requires a metadata engine** (Redis, MySQL, PostgreSQL, TiKV, SQLite) reachable by every VM | Candidate when POSIX semantics justify an extra service. Planned as a second backend behind the same interface; not implemented. |
+| s3fs-fuse | object-store mount | GPL-2.0 | Whole-object rewrite | Object listing | Mature but GPL, no flush API, weaker rename semantics. |
+| Mountpoint for Amazon S3 | object-store mount, sequential writes only | Apache-2.0 | No edits of existing objects, no append | Object listing | Read-mostly workloads on AWS only. |
+| geesefs | object-store mount | Apache-2.0 | Partial (server-side part copies) | Object listing | Smaller community; kept as a candidate. |
+
+For a first release that people can point at any bucket without running a database, an object-store mount with honest, documented semantics beats a POSIX filesystem with a hidden dependency. The mount logic is isolated in [src/rclone.ts](../src/rclone.ts) so a JuiceFS backend can slot in.

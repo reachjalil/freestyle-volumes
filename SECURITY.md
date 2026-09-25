@@ -18,4 +18,4 @@ Fixes land in the latest `0.x` release on npm. Upgrade to receive them.
 - **The bucket probe** (`checkStorage`, `freestyle-volumes doctor`) writes one object under `<prefix>/_doctor/` and deletes it again; `reconcile` reports any probe an interrupted check left behind.
 - **Destructive operations** need the target repeated: `delete` and `releaseLease` the volume id, `discardMount` the mount path, `removeOrphanGeneration` `<volume>/<generation>`.
 
-More detail: the [security notes](README.md#security-notes) and [Freestyle operational notes](docs/freestyle.md#operational-notes).
+More detail: the README's [security section](README.md#security), the [API reference](docs/api.md#sandbox-credentials) and the [Freestyle operational notes](docs/freestyle.md#operational-notes).
