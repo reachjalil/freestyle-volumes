@@ -18,6 +18,7 @@ Freestyle VMs are full Linux machines with snapshots and forks, but a VM's disk 
 - **Library and CLI.** A TypeScript API (`create`, `get`, `list`, `clone`, `attach`, `inspect`, `detach`, `delete`) and a `freestyle-volumes` command with the same verbs.
 - **Honest durability.** `detach()` returns `flushed: true` only after every pending upload has reached the bucket.
 - **Fast attach.** Bake the mount runtime into a Freestyle snapshot once, and VMs booted from it skip the minute-or-two install on first attach.
+- **Safe shutdown and preflight.** `detachAll()` drains every mount before a VM is deleted or snapshotted, and `freestyle-volumes doctor` checks your bucket and VMs before the first attach.
 - **Nothing extra to run.** The bucket is the only durable store. No metadata server, no daemon on your side.
 
 Community project. Not affiliated with or endorsed by [Freestyle](https://www.freestyle.sh) or [Daytona](https://www.daytona.io). "Daytona-style" describes the developer experience (named volumes, `mountPath`, `subpath`, shared across sandboxes), not API compatibility or identical filesystem semantics.
@@ -70,10 +71,11 @@ The first attach on a fresh VM installs `fuse3` and a pinned, checksum-verified 
 
 Freestyle checklist:
 
+0. Run `npx freestyle-volumes doctor --vm <vm-id>` once: it checks the bucket from your machine and the VM from the inside. See [preflight](#preflight-with-doctor).
 1. Boot from an Ubuntu base (`freestyle/ubuntu*`) or a snapshot of one. `freestyle/busybox` has no package manager and fails with `RUNTIME_INSTALL`.
 2. Allow outbound traffic to the storage endpoint, plus `downloads.rclone.org` and the apt mirrors on first use. The broad rule above is a starting point, not least privilege.
 3. Attach with `uid: 1000, gid: 1000` when the VM's default `ubuntu` user should own the files. Mounts use `allowOther`, so every user can reach them either way.
-4. Detach before snapshotting or deleting a VM. A snapshot taken while attached captures the mount process, its credentials (in its environment) and its write cache.
+4. Detach before snapshotting or deleting a VM: `await volumes.detachAll({ sandboxId: vmId })` drains every mount and reports `flushed: true` when nothing is left behind. A snapshot taken while attached captures the mount process, its credentials (in its environment) and its write cache.
 
 ## Fast attach with a volume-ready snapshot
 
@@ -119,9 +121,58 @@ npx freestyle-volumes delete datasets --confirm datasets
 | `attach <vm> <volume> <mountPath> [--read-only] [--subpath dir] [--uid n] [--gid n] ...` | Mount a volume. [Mount options](#mount-options) are flags such as `--cache-mode full` or `--write-back 10`; see `--help`. |
 | `inspect <vm> <mountPath>` | `mounted`, `stale`, `absent` or `unmanaged`, with the upload queue and log tail. |
 | `detach <vm> <mountPath> [--flush-timeout ms] [--force]` | Unmount after verifying the drain. |
+| `mounts <vm>` | Every mount this library manages in the VM, healthy or stale, plus rclone mounts it did not create. |
+| `detach-all <vm> [--flush-timeout ms] [--force]` | Detach every managed mount; exits 1 if any could not be detached. Use it before deleting a VM. |
+| `doctor [--vm <vm>]` | [Preflight](#preflight-with-doctor) the bucket and optionally a VM; exits 1 if any check fails. |
 | `prepare-snapshot [--base id] [--slug slug] [--name label]` | Build a [volume-ready snapshot](#fast-attach-with-a-volume-ready-snapshot). |
 
 Global options: `--env-file <path>` (variables already set win), `--prefix <namespace>`, `--docker` (treat `<vm>` as a local container), `--quiet`. Progress goes to stderr. Exit codes: `0` success, `1` the operation failed (the error code and details are on stderr), `2` usage or configuration error. Commands that touch a VM need the `freestyle` SDK installed next to `freestyle-volumes`; for a one-off run outside a project, use `npx -p freestyle -p freestyle-volumes freestyle-volumes ...`.
+
+## Preflight with doctor
+
+Most first-attach failures are configuration: a firewall that blocks the bucket, a provider without conditional writes, an image without FUSE. `doctor` finds them up front. From your machine it probes the bucket: reachability, listing, atomic conditional creates (it writes one probe object twice and expects the second write to be rejected, then deletes it), read-back and delete. With `--vm`, it also checks inside the VM: CPU, root, `/dev/fuse`, `fusermount3`, `flock`, rclone, whether the VM itself can list the bucket with your credentials, and free disk for the write cache. The VM check installs and changes nothing.
+
+```text
+$ npx freestyle-volumes doctor --vm <vm-id>
+ok   storage bucket: The bucket exists and these credentials can reach it.
+ok   storage list: Listing freestyle-volumes/ works.
+ok   storage conditional-create: Conditional creates are enforced: a second create of the same key was rejected.
+ok   storage read: The probe object read back unchanged.
+ok   storage delete: Deleting the probe object works.
+ok   <vm-id> arch: aarch64
+ok   <vm-id> root: scripts run as uid 0
+FAIL <vm-id> fuse-device: /dev/fuse is missing
+     Freestyle Ubuntu VMs expose /dev/fuse. A Docker container needs --device /dev/fuse --cap-add SYS_ADMIN.
+warn <vm-id> fusermount: not installed; attach installs fuse3 with apt-get
+ok   <vm-id> flock: /usr/bin/flock
+warn <vm-id> rclone: no rclone >= 1.68.0; attach downloads 1.75.1 from downloads.rclone.org
+     Boot from a volume-ready snapshot (createVolumeReadySnapshot or `freestyle-volumes prepare-snapshot`) to skip the download on attach.
+...
+```
+
+That output comes from a bare `ubuntu:24.04` container without FUSE. `warn` lines are things attach will install, or could not be tested yet; only `FAIL` lines block an attach. The same checks are available as `volumes.checkStorage()` and `volumes.checkSandbox({ sandboxId })`, and the JSON report goes to stdout.
+
+## Recipe: agent runs
+
+A common Freestyle pattern is one VM per agent run, with shared inputs and collected outputs. Keep the agent's working directory on the VM's own disk and put only inputs and finished artifacts on volumes:
+
+```ts
+await volumes.attach({ sandboxId: vmId, volumeId: 'datasets', mountPath: '/home/ubuntu/data', readOnly: true });
+await volumes.attach({ sandboxId: vmId, volumeId: 'runs', subpath: runId, mountPath: '/home/ubuntu/out', uid: 1000, gid: 1000 });
+// ... the agent runs ...
+const { flushed } = await volumes.detachAll({ sandboxId: vmId });
+if (flushed) await vm.delete(); // otherwise keep the VM: its cache still holds unuploaded writes
+```
+
+Read-only inputs cannot be damaged by a run, and each run's `subpath` keeps its outputs apart from every other run in one volume. The complete version is [examples/agent-run.ts](examples/agent-run.ts).
+
+To seed a volume without a VM, write straight into its data prefix with any S3 tool; mounts see new files after their directory cache (`dirCacheSeconds`) expires:
+
+```bash
+aws s3 sync ./data "s3://my-volumes/$(npx freestyle-volumes get datasets | jq -r .dataPrefix)/"
+```
+
+Add `--endpoint-url` for R2 or MinIO. The same prefix is where finished outputs can be read back.
 
 ## How it works
 
@@ -163,9 +214,15 @@ The volume methods return promises and throw `VolumeError` subclasses with a sta
 | `inspectMount({ sandboxId, mountPath })` | `status` is `mounted`, `stale` (process or mount gone, cache may hold unflushed writes), `absent`, or `unmanaged` (an rclone mount this library did not create), plus pid, upload queue counts, cache size and the log tail. |
 | `detach({ sandboxId, mountPath, flushTimeoutMs?, force? })` | Unmounts first, waits for FUSE serving to stop, drains the retained VFS, then stops the process. Removes cache/state and the advisory attachment record only after a verified drain. Uncertain forced detach retains them and returns `flushed: false`. Never deletes volume data. |
 | `delete({ volumeId, confirm, force? })` | Destroys the record and every object under the volume's data prefix. `confirm` must equal `volumeId`. Refuses while attachment records exist unless `force`. |
+| `listMounts({ sandboxId })` | Every mount this library manages in the sandbox (`mounted` or `stale`, with volume, subpath, mode and pid) plus `unmanaged` rclone mounts. A point-in-time view; takes no locks. |
+| `detachAll({ sandboxId, flushTimeoutMs?, force? })` | Detaches every managed mount in turn. Never throws for one mount: failures are listed in `results` with their recovery data retained, and `flushed` is true only when nothing unflushed is left. Unmanaged mounts are left alone. |
+| `checkStorage()` | Preflight of the bucket from this process, including whether the provider enforces conditional creates. Returns `{ ok, checks }`; never throws for a failed check. |
+| `checkSandbox({ sandboxId, timeoutMs? })` | Read-only preflight inside a sandbox: runtime, FUSE, whether it can list the bucket with these credentials, cache disk. Returns `{ ok, checks }` with a hint for each warning or failure. |
 | `createVolumeReadySnapshot(freestyle, { baseSnapshotId?, slug?, displayName?, firewall?, bootstrapTimeoutMs?, builderTtlSeconds?, onEvent? })` | Builds a Freestyle snapshot with the mount runtime preinstalled. Returns `{ snapshotId, slug, builderVmId, runtime, warnings }`. |
 
 ### Storage configuration
+
+`storageConfigFromEnv(env = process.env)` builds this object from the `VOLUMES_S3_*` variables the CLI uses (see [.env.example](.env.example)), and throws a `VALIDATION` error that names any missing required variable.
 
 | Field | Default | Meaning |
 | :--- | :--- | :--- |
@@ -297,9 +354,9 @@ Preview (`0.x`): the API can change between minor versions, and each change is l
 
 | Tier | What it proves | Latest result (0.2.0, 2026-09-25) |
 | :--- | :--- | :--- |
-| Unit tests (mocked VM, in-memory store, guest-script harness) | Validation, script generation, error mapping, registry, clone, Git checks, CLI, snapshot helper | `pnpm test`: 127 passed, 0 skipped. SDK and example type checks passed. |
+| Unit tests (mocked VM, in-memory store, guest scripts run in a local shell) | Validation, script generation, error mapping, registry, clone, Git checks, CLI, snapshot helper, mount listing, preflight checks | `pnpm test`: 146 passed, 0 skipped. SDK and example type checks passed. |
 | Package smoke test | The packed tarball installs and works: ESM and `require()`, the CLI bin, TypeScript under nodenext, bundler and node10 | `pnpm test:package`: passed. |
-| Linux integration (Docker + MinIO, real rclone FUSE) | Lifecycle, isolation, failure recovery, post-unmount drain, Git on FUSE, the CLI end to end, bare Ubuntu bootstrap, minimum and pinned rclone | `VOLUMES_TEST_BOOTSTRAP=1 pnpm test:integration`: 28 passed, 0 skipped (local Docker, linux/arm64). CI runs the same suite on linux/amd64. |
+| Linux integration (Docker + MinIO, real rclone FUSE) | Lifecycle, isolation, failure recovery, post-unmount drain, `detachAll` with crashed and unmanaged mounts, preflight checks, Git on FUSE, the CLI end to end, bare Ubuntu bootstrap, minimum and pinned rclone | `VOLUMES_TEST_BOOTSTRAP=1 pnpm test:integration`: 33 passed, 0 skipped (local Docker, linux/arm64). CI runs the same suite on linux/amd64. |
 | Freestyle live (real VMs, billed) | The round trip and the snapshot build on Freestyle's Ubuntu image | **Not yet run**: 2 skipped without credentials. Needs a Freestyle API key and a bucket: run the manual [Freestyle live test](.github/workflows/freestyle-live.yml) workflow or `pnpm test:freestyle`. |
 
 Docker results are not Freestyle results: they exercise the mount mechanics on real FUSE, while the Freestyle adapter is checked against the SDK's types until the live test runs. Multipart copy is verified with a small real fixture plus mocked large-size boundaries, not an actual 5 TiB copy; Git with local smart HTTP on real FUSE, not live authenticated GitHub. Details and history: [docs/evidence](docs/evidence/v0.2.md).

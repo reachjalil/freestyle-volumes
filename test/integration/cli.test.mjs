@@ -75,6 +75,24 @@ if (!dockerAvailable()) {
       assert.deepEqual(await stack.listKeys(volume.dataPrefix), []);
     });
 
+    test('doctor, mounts and detach-all against a real container', () => {
+      const doctor = cli('doctor', '--docker', '--vm', sandbox);
+      assert.equal(doctor.code, 0, doctor.stderr);
+      assert.equal(doctor.json().ok, true);
+      assert.match(doctor.stderr, /^ok {3}storage conditional-create: /m);
+      assert.match(doctor.stderr, new RegExp(`^ok {3}${sandbox} storage: rclone listed the namespace from inside the sandbox$`, 'm'));
+
+      assert.equal(cli('create', 'cli-all').code, 0);
+      assert.equal(cli('attach', '--docker', sandbox, 'cli-all', '/mnt/all-a').code, 0);
+      assert.equal(cli('attach', '--docker', sandbox, 'cli-all', '/mnt/all-b', '--read-only').code, 0);
+      assert.deepEqual(cli('mounts', '--docker', sandbox).json().mounts.map((m) => [m.mountPath, m.status]), [['/mnt/all-a', 'mounted'], ['/mnt/all-b', 'mounted']]);
+      const drained = cli('detach-all', '--docker', sandbox);
+      assert.equal(drained.code, 0, drained.stderr);
+      assert.equal(drained.json().flushed, true);
+      assert.deepEqual(cli('mounts', '--docker', sandbox).json().mounts, []);
+      assert.equal(cli('delete', 'cli-all', '--confirm', 'cli-all').code, 0);
+    });
+
     test('operation failures exit 1 with the error code', () => {
       const missing = cli('attach', '--docker', sandbox, 'no-such-volume', '/mnt/none');
       assert.equal(missing.code, 1);

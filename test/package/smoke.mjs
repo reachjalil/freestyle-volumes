@@ -65,7 +65,7 @@ try {
       import * as docker from 'freestyle-volumes/docker';
       import * as git from 'freestyle-volumes/git';
       import manifest from 'freestyle-volumes/package.json' with { type: 'json' };
-      for (const name of ['FreestyleVolumes', 'freestyleSandboxes', 'createVolumeReadySnapshot', 'dockerSandboxes', 'volumeGit', 'VolumeError', 'MemoryObjectStore']) {
+      for (const name of ['FreestyleVolumes', 'freestyleSandboxes', 'createVolumeReadySnapshot', 'storageConfigFromEnv', 'dockerSandboxes', 'volumeGit', 'VolumeError', 'MemoryObjectStore']) {
         assert.equal(typeof root[name], 'function', name);
       }
       assert.equal(typeof freestyle.createVolumeReadySnapshot, 'function');
@@ -82,6 +82,7 @@ try {
       });
       await volumes.create({ name: 'smoke' });
       assert.deepEqual((await volumes.list()).map((v) => v.name), ['smoke']);
+      assert.equal((await volumes.checkStorage()).ok, true, 'the bucket probe runs from the installed package');
     `;
     run(process.execPath, ['--input-type=module', '-e', script], { cwd: consumer });
   });
@@ -89,16 +90,17 @@ try {
   step('run the installed CLI', () => {
     const bin = join(consumer, 'node_modules', '.bin', 'freestyle-volumes');
     assert.equal(run(bin, ['--version'], { cwd: consumer }).trim(), manifest.version);
-    assert.match(run(bin, ['--help'], { cwd: consumer }), /prepare-snapshot/);
+    const help = run(bin, ['--help'], { cwd: consumer });
+    for (const command of ['prepare-snapshot', 'mounts', 'detach-all', 'doctor']) assert.match(help, new RegExp(`^  ${command} `, 'm'), command);
     const missing = spawnSync(bin, ['list'], { cwd: consumer, encoding: 'utf8', env: { PATH: process.env.PATH } });
     assert.equal(missing.status, 2);
-    assert.match(missing.stderr, /Missing VOLUMES_S3_BUCKET/);
+    assert.match(missing.stderr, /Missing environment variables: VOLUMES_S3_BUCKET/);
   });
 
   step('type-check a consumer under nodenext, bundler and node10 resolution', () => {
     writeFileSync(join(consumer, 'index.ts'), `
       import { Freestyle } from 'freestyle';
-      import { FreestyleVolumes, freestyleSandboxes, createVolumeReadySnapshot, isVolumeError, type Volume, type VolumeAttachment, type DetachResult } from 'freestyle-volumes';
+      import { FreestyleVolumes, freestyleSandboxes, createVolumeReadySnapshot, isVolumeError, storageConfigFromEnv, type Volume, type VolumeAttachment, type DetachResult, type DetachAllResult, type MountListing, type CheckReport } from 'freestyle-volumes';
       import { freestyleSandboxes as fromSubpath, type VolumeReadySnapshot } from 'freestyle-volumes/freestyle';
       import { dockerSandboxes } from 'freestyle-volumes/docker';
       import { volumeGit, type GitStatus } from 'freestyle-volumes/git';
@@ -115,6 +117,10 @@ try {
       export const snapshot: Promise<VolumeReadySnapshot> = createVolumeReadySnapshot(freestyle, { baseSnapshotId: 'freestyle/ubuntu-sm', slug: 'ubuntu-sm-volumes' });
       export const status: Promise<GitStatus> = volumeGit({ volumes, sandboxes: fromSubpath(freestyle) }).status({ sandboxId: 'vm', mountPath: '/mnt/src' });
       export const check = (error: unknown) => isVolumeError(error, 'FLUSH_FAILED');
+      export const fromEnv = new FreestyleVolumes({ storage: storageConfigFromEnv({ VOLUMES_S3_BUCKET: 'b', VOLUMES_S3_ACCESS_KEY_ID: 'id', VOLUMES_S3_SECRET_ACCESS_KEY: 's' }), sandboxes: dockerSandboxes() });
+      export const mounts: Promise<MountListing> = volumes.listMounts({ sandboxId: 'vm' });
+      export const drained: Promise<DetachAllResult> = volumes.detachAll({ sandboxId: 'vm' }).then((result) => { if (!result.flushed) for (const entry of result.results) if (entry.status === 'failed') console.error(entry.error.code); return result; });
+      export const preflight: Promise<CheckReport[]> = Promise.all([volumes.checkStorage(), volumes.checkSandbox({ sandboxId: 'vm' })]);
     `);
     const configs = {
       nodenext: { module: 'nodenext', moduleResolution: 'nodenext' },

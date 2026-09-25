@@ -7,7 +7,7 @@
 // Optional: VOLUMES_S3_ENDPOINT, VOLUMES_S3_REGION, VOLUMES_S3_PREFIX, VOLUMES_S3_FORCE_PATH_STYLE, VOLUMES_S3_PROVIDER, VOLUMES_TEST_SNAPSHOT
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { FreestyleVolumes, createVolumeReadySnapshot, freestyleSandboxes } from '../../dist/index.js';
+import { FreestyleVolumes, createVolumeReadySnapshot, freestyleSandboxes, storageConfigFromEnv } from '../../dist/index.js';
 
 const env = process.env;
 const required = ['FREESTYLE_API_KEY', 'VOLUMES_S3_BUCKET', 'VOLUMES_S3_ACCESS_KEY_ID', 'VOLUMES_S3_SECRET_ACCESS_KEY'];
@@ -17,16 +17,7 @@ const skip = env.VOLUMES_TEST_PREPARE_SNAPSHOT !== '1' ? 'set VOLUMES_TEST_PREPA
 test('Freestyle live: volume-ready snapshot, then attach without installs on a VM booted from it', { skip, timeout: 30 * 60 * 1000 }, async () => {
   const { Freestyle } = await import('freestyle');
   const freestyle = new Freestyle({ apiKey: env.FREESTYLE_API_KEY });
-  const storage = {
-    bucket: env.VOLUMES_S3_BUCKET,
-    accessKeyId: env.VOLUMES_S3_ACCESS_KEY_ID,
-    secretAccessKey: env.VOLUMES_S3_SECRET_ACCESS_KEY,
-    prefix: env.VOLUMES_S3_PREFIX || 'freestyle-volumes-live-test',
-  };
-  if (env.VOLUMES_S3_ENDPOINT) storage.endpoint = env.VOLUMES_S3_ENDPOINT;
-  if (env.VOLUMES_S3_REGION) storage.region = env.VOLUMES_S3_REGION;
-  if (env.VOLUMES_S3_PROVIDER) storage.provider = env.VOLUMES_S3_PROVIDER;
-  if (env.VOLUMES_S3_FORCE_PATH_STYLE) storage.forcePathStyle = env.VOLUMES_S3_FORCE_PATH_STYLE === 'true';
+  const storage = { prefix: 'freestyle-volumes-live-test', ...storageConfigFromEnv(env) };
   const log = (event) => console.log(`[event] ${JSON.stringify(event)}`);
   const volumes = new FreestyleVolumes({ storage, sandboxes: freestyleSandboxes(freestyle), onEvent: log });
   const firewall = { rules: [{ action: 'allow', source: {}, destination: { public: true } }] };
@@ -49,6 +40,10 @@ test('Freestyle live: volume-ready snapshot, then attach without installs on a V
     vm = created.vm;
     const preinstalled = await vm.exec({ command: `test -x ${built.runtime.rclonePath} && command -v fusermount3 && command -v flock`, linuxUser: 'root' });
     assert.equal(preinstalled.statusCode, 0, `runtime missing on a VM booted from the snapshot:\n${preinstalled.stdout}\n${preinstalled.stderr}`);
+    // With rclone preinstalled, the preflight proves credentials and network from inside the VM.
+    const vmReport = await volumes.checkSandbox({ sandboxId: created.vmId });
+    console.log(`[checkSandbox] ${JSON.stringify(vmReport)}`);
+    assert.deepEqual(vmReport.checks.filter((check) => check.status !== 'ok').map((check) => check.name).filter((name) => name !== 'cache-disk'), [], 'a prepared VM needs no installs and reaches the bucket');
 
     await volumes.create({ name: volumeName, labels: { test: 'live-snapshot' } });
     const attachStarted = Date.now();

@@ -19,7 +19,7 @@ The integration suite creates containers named `fsvol-*` and removes them afterw
 
 - TypeScript, ES modules, Node 22+, no build step other than `tsc`.
 - Volume failures use `VolumeError` with a stable `code` and a `hint`; the separate Git helper uses `VolumeGitError` with a stable `code` and `outcomeUnknown`. Add a code rather than a new prose-only error.
-- Guest scripts are POSIX `sh` (BusyBox compatible: no bashisms, no `flock -w`, no `timeout --foreground`). Run `sh -n` on generated scripts in unit tests.
+- Guest scripts are POSIX `sh` (BusyBox compatible: no bashisms, no `flock -w`, no `timeout --foreground`). Run `sh -n` on generated scripts in unit tests, execute them with `test/helpers/local-sandbox.mjs` (the real script in a local shell, with only Linux probes such as `/proc/mounts` overridden at a marker line), and cover them on real FUSE in `test/integration/`.
 - Nothing that reaches a shell is unvalidated; extend `src/validate.ts` before adding a new script parameter.
 - Never log or embed credentials. Tests assert that the secret never appears in commands, events or error messages.
 - Say what was verified where. Docker results are not Freestyle results; keep the tiers separate in docs and evidence files.

@@ -74,7 +74,7 @@ test('usage errors exit 2 without touching storage', async () => {
 test('missing or invalid configuration names the variables to set', async () => {
   const missing = await cli(['list'], { env: { VOLUMES_S3_BUCKET: 'b' } });
   assert.equal(missing.code, 2);
-  assert.match(missing.stderr, /Missing VOLUMES_S3_ACCESS_KEY_ID, VOLUMES_S3_SECRET_ACCESS_KEY/);
+  assert.match(missing.stderr, /Missing environment variables: VOLUMES_S3_ACCESS_KEY_ID, VOLUMES_S3_SECRET_ACCESS_KEY/);
   const pathStyle = await cli(['list'], { env: { ...ENV, VOLUMES_S3_FORCE_PATH_STYLE: 'maybe' }, objectStore: new MemoryObjectStore() });
   assert.equal(pathStyle.code, 2);
   assert.match(pathStyle.stderr, /VOLUMES_S3_FORCE_PATH_STYLE must be true or false/);
@@ -208,6 +208,73 @@ test('prepare-snapshot drives the Freestyle client without storage configuration
   assert.equal((await cli(['prepare-snapshot', '--slug', 'Bad_Slug'], { env: {}, freestyle })).code, 2);
   assert.equal((await cli(['prepare-snapshot', '--docker'], { env: {}, freestyle })).code, 2);
   const noKey = await cli(['prepare-snapshot'], { env: {} });
+  assert.equal(noKey.code, 2);
+  assert.match(noKey.stderr, /FREESTYLE_API_KEY is not set/);
+});
+
+test('mounts lists a VM, and detach-all exits 1 unless every mount detached', async () => {
+  const listing = 'FSVOL_MOUNT mid=aaaa000000000001 mounted=1 alive=1 pid=7 ro=0 state={"mountPath":"/mnt/a","volumeId":"a"}\nFSVOL_UNMANAGED /mnt/foreign\nFSVOL_RESULT status=listed\n';
+  const sandbox = new FakeSandbox('vm-1', [
+    { stdout: listing },
+    { stdout: listing },
+    { stdout: 'FSVOL_RESULT status=detached flushed=1 pending=0 volume=a mid=aaaa000000000001 ro=0\n' },
+    { stdout: listing },
+    { stdout: 'FSVOL_ERR flush-timeout pending=1 errored=0\n', exitCode: 30 },
+    { stdout: listing },
+    { stdout: 'FSVOL_RESULT status=detached flushed=0 pending=-1 volume=a mid=aaaa000000000001 ro=0\n' },
+  ]);
+  const io = { objectStore: new MemoryObjectStore(), sandboxes: fakeResolver([sandbox]) };
+
+  const mounts = await cli(['mounts', 'vm-1'], io);
+  assert.equal(mounts.code, 0, mounts.stderr);
+  assert.deepEqual(mounts.json().mounts.map((m) => [m.mountPath, m.status, m.volumeId]), [['/mnt/a', 'mounted', 'a']]);
+  assert.deepEqual(mounts.json().unmanaged, ['/mnt/foreign']);
+
+  const drained = await cli(['detach-all', 'vm-1'], io);
+  assert.equal(drained.code, 0, drained.stderr);
+  assert.equal(drained.json().flushed, true);
+
+  const failed = await cli(['detach-all', 'vm-1', '--flush-timeout', '5000'], io);
+  assert.equal(failed.code, 1);
+  assert.equal(failed.json().flushed, false, 'the full result is still printed');
+  assert.match(failed.stderr, /error: \/mnt\/a: FLUSH_FAILED: /);
+
+  const forced = await cli(['detach-all', 'vm-1', '--force'], io);
+  assert.equal(forced.code, 0, 'a forced detach is not a failure');
+  assert.match(forced.stderr, /warning: \/mnt\/a detached without a verified flush/);
+  assert.match(sandbox.calls[6].command, /FORCE=1\n/);
+});
+
+test('doctor checks the bucket, and a VM with --vm; exit 1 on any failure', async () => {
+  const healthy = await cli(['doctor'], { objectStore: new MemoryObjectStore() });
+  assert.equal(healthy.code, 0, healthy.stderr);
+  assert.equal(healthy.json().ok, true);
+  assert.equal(healthy.json().sandbox, undefined);
+  assert.deepEqual(healthy.json().storage.checks.map((c) => c.name), ['bucket', 'list', 'conditional-create', 'read', 'delete']);
+  assert.match(healthy.stderr, /^ok {3}storage conditional-create: /m);
+  assert.equal((await cli(['doctor', '--quiet'], { objectStore: new MemoryObjectStore() })).stderr, '');
+
+  class IgnoresConditions extends MemoryObjectStore {
+    async putObjectIfAbsent(key, body) {
+      this.objects.set(key, body);
+      return true;
+    }
+  }
+  const unsafe = await cli(['doctor'], { objectStore: new IgnoresConditions() });
+  assert.equal(unsafe.code, 1);
+  assert.match(unsafe.stderr, /^FAIL storage conditional-create: .*If-None-Match/m);
+  assert.match(unsafe.stderr, /^ {5}Use a provider/m, 'hints are indented under the failure');
+
+  const vm = new FakeSandbox('vm-1', [{ stdout: 'FSVOL_CHECK arch ok x86_64\nFSVOL_CHECK fuse-device fail /dev/fuse is missing\nFSVOL_CHECK rclone warn no rclone\nFSVOL_RESULT status=checked\n' }]);
+  const withVm = await cli(['doctor', '--vm', 'vm-1'], { objectStore: new MemoryObjectStore(), sandboxes: fakeResolver([vm]) });
+  assert.equal(withVm.code, 1);
+  assert.equal(withVm.json().storage.ok, true);
+  assert.deepEqual(withVm.json().sandbox.checks.map((c) => [c.name, c.status]), [['arch', 'ok'], ['fuse-device', 'fail'], ['rclone', 'warn']]);
+  assert.match(withVm.stderr, /^FAIL vm-1 fuse-device: \/dev\/fuse is missing$/m);
+  assert.match(withVm.stderr, /^warn vm-1 rclone: no rclone$/m);
+  assert.equal(vm.calls[0].env.RCLONE_CONFIG_FSVOL_ACCESS_KEY_ID, ENV.VOLUMES_S3_ACCESS_KEY_ID);
+
+  const noKey = await cli(['doctor', '--vm', 'vm-1'], { objectStore: new MemoryObjectStore() });
   assert.equal(noKey.code, 2);
   assert.match(noKey.stderr, /FREESTYLE_API_KEY is not set/);
 });

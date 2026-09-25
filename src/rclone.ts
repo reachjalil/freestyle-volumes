@@ -6,7 +6,7 @@
  * Credentials never appear in these scripts. They reach rclone only through
  * `RCLONE_CONFIG_FSVOL_*` environment variables (see storage.ts).
  */
-import { MountError, VolumeError } from './errors.js';
+import { MountError, SandboxError, VolumeError } from './errors.js';
 import { runGuest, type GuestRun, type SandboxRuntime } from './sandbox.js';
 import { shellQuote as q } from './validate.js';
 
@@ -224,8 +224,13 @@ function versionParts(version: string): [number, number] {
   return [Number(major), Number(minor)];
 }
 
-export function bootstrapScript(paths: GuestPaths): string {
+/** `rclone_ok <binary>`: succeeds when the binary is rclone >= RCLONE_MIN_VERSION. Shared by bootstrap and checks. */
+function rcloneOkFunction(): string {
   const [minMajor, minMinor] = versionParts(RCLONE_MIN_VERSION);
+  return `rclone_ok() { b="$1"; v=$("$b" version 2>/dev/null | sed -n '1s/^rclone v\\([0-9][0-9.]*\\).*/\\1/p'); [ -n "$v" ] || return 1; maj=$(echo "$v" | cut -d. -f1); min=$(echo "$v" | cut -d. -f2); [ -n "$min" ] || min=0; [ "$maj" -gt ${minMajor} ] && return 0; [ "$maj" -eq ${minMajor} ] && [ "$min" -ge ${minMinor} ]; }`;
+}
+
+export function bootstrapScript(paths: GuestPaths): string {
   return `${prelude(paths)}
 umask 022
 mkdir -p "$STATE_ROOT/mounts" "$RUN_ROOT" "$CACHE_ROOT" "$BIN_DIR" || { echo "FSVOL_ERR mkdir"; exit 11; }
@@ -239,7 +244,7 @@ if ! have fusermount3 && ! have fusermount; then pkg_install fuse3 || { echo "FS
 if ! have flock; then pkg_install util-linux || { echo 'FSVOL_ERR tool-missing flock'; exit 13; }; fi
 fsvol_fusermount >/dev/null || { echo "FSVOL_ERR fuse3-missing"; exit 13; }
 for t in setsid timeout awk sha256sum sed grep flock readlink tr; do have "$t" || { echo "FSVOL_ERR tool-missing $t"; exit 13; }; done
-rclone_ok() { b="$1"; v=$("$b" version 2>/dev/null | sed -n '1s/^rclone v\\([0-9][0-9.]*\\).*/\\1/p'); [ -n "$v" ] || return 1; maj=$(echo "$v" | cut -d. -f1); min=$(echo "$v" | cut -d. -f2); [ -n "$min" ] || min=0; [ "$maj" -gt ${minMajor} ] && return 0; [ "$maj" -eq ${minMajor} ] && [ "$min" -ge ${minMinor} ]; }
+${rcloneOkFunction()}
 RC=""
 if [ -x "$BIN_DIR/rclone" ] && rclone_ok "$BIN_DIR/rclone"; then RC="$BIN_DIR/rclone"; elif have rclone && rclone_ok "$(command -v rclone)"; then RC="$(command -v rclone)"; fi
 if [ -z "$RC" ]; then
@@ -498,6 +503,142 @@ echo "FSVOL_ERR flush-timeout pending=$pending errored=$errored"; fsvol_log_tail
 `;
 }
 
+/**
+ * Read-only listing of every managed mount state (healthy or not) and every
+ * rclone mount without one. Takes no locks, so it is a point-in-time view.
+ */
+export function listMountsScript(paths: GuestPaths): string {
+  return `${prelude(paths)}
+fsvol_rclone_mounts() { awk '$3 == "fuse.rclone" { print $2 }' /proc/mounts 2>/dev/null; }
+# List managed mounts: one state directory each, whatever its process is doing.
+for f in "$STATE_ROOT"/mounts/*/mount.json; do
+  [ -f "$f" ] || continue
+  SD=\${f%/mount.json}; MID=\${SD##*/}; SOCK="$RUN_ROOT/$MID.sock"
+  mp=$(sed -n 's/.*"mountPath":"\\([^"]*\\)".*/\\1/p' "$f" | head -n 1)
+  mounted=0; [ -n "$mp" ] && fsvol_mounted "$mp" && mounted=1
+  pid=""; [ -f "$SD/pid" ] && pid=$(cat "$SD/pid" 2>/dev/null)
+  case "$pid" in *[!0-9]*) pid="";; esac
+  alive=0; fsvol_owned "$pid" && alive=1
+  ro=""; [ "$mounted" = 1 ] && ro=$(fsvol_mount_ro "$mp")
+  printf 'FSVOL_MOUNT mid=%s mounted=%s alive=%s pid=%s ro=%s state=%s\\n' "$MID" "$mounted" "$alive" "$pid" "$ro" "$(tr -d '\\n' < "$f")"
+done
+# rclone mounts without a state record were not created by this library.
+fsvol_rclone_mounts | while IFS= read -r m; do
+  [ -n "$(fsvol_find_state "$m")" ] || printf 'FSVOL_UNMANAGED %s\\n' "$m"
+done
+echo "FSVOL_RESULT status=listed"
+`;
+}
+
+export interface GuestCheckOptions {
+  /** rclone remote path listed from inside the sandbox to prove network and credentials, e.g. `fsvol:bucket/prefix`. */
+  remotePath: string;
+  /** URL probed with curl instead when rclone is not installed yet. */
+  endpointUrl: string;
+}
+
+/**
+ * Read-only preflight: reports what attach would find, install or fail on.
+ * Installs nothing, takes no locks and writes nothing. Storage credentials
+ * reach rclone through the exec environment, exactly as for a mount.
+ */
+export function checkScript(paths: GuestPaths, options: GuestCheckOptions): string {
+  return `${prelude(paths)}
+check() { printf 'FSVOL_CHECK %s %s %s\\n' "$1" "$2" "$3"; }
+http_code() { curl -s -o /dev/null -w '%{http_code}' --connect-timeout 10 --max-time 20 "$1" 2>/dev/null; }
+${rcloneOkFunction()}
+FUSE_DEV=/dev/fuse
+# Check the runtime attach needs.
+arch=$(uname -m)
+case "$arch" in x86_64|amd64|aarch64|arm64) check arch ok "$arch";; *) check arch fail "$arch";; esac
+uid=$(id -u 2>/dev/null)
+if [ "$uid" = 0 ]; then check root ok "scripts run as uid 0"; else check root fail "scripts run as uid $uid"; fi
+if [ -e "$FUSE_DEV" ]; then check fuse-device ok /dev/fuse; else check fuse-device fail "/dev/fuse is missing"; fi
+PM=""; if have apt-get; then PM=apt-get; elif have apk; then PM=apk; fi
+if FM=$(fsvol_fusermount); then check fusermount ok "$FM"
+elif [ -n "$PM" ]; then check fusermount warn "not installed; attach installs fuse3 with $PM"
+else check fusermount fail "not installed, and there is no apt-get or apk to install fuse3"; fi
+if have flock; then check flock ok "$(command -v flock)"
+elif [ -n "$PM" ]; then check flock warn "not installed; attach installs util-linux with $PM"
+else check flock fail "not installed, and there is no apt-get or apk to install util-linux"; fi
+RC=""
+if [ -x "$BIN_DIR/rclone" ] && rclone_ok "$BIN_DIR/rclone"; then RC="$BIN_DIR/rclone"; elif have rclone && rclone_ok "$(command -v rclone)"; then RC="$(command -v rclone)"; fi
+if [ -n "$RC" ]; then check rclone ok "$RC v$("$RC" version 2>/dev/null | sed -n '1s/^rclone v//p')"
+else check rclone warn "no rclone >= ${RCLONE_MIN_VERSION}; attach downloads ${RCLONE_VERSION} from downloads.rclone.org"; fi
+if [ -z "$RC" ]; then
+  if have curl; then
+    code=$(http_code https://downloads.rclone.org/)
+    case "$code" in ''|000) check rclone-download fail "downloads.rclone.org did not answer";; *) check rclone-download ok "downloads.rclone.org answered HTTP $code";; esac
+  elif have wget; then
+    if wget -q -T 20 -O /dev/null https://downloads.rclone.org/ 2>/dev/null; then check rclone-download ok "downloads.rclone.org answered"; else check rclone-download fail "downloads.rclone.org did not answer"; fi
+  elif [ -n "$PM" ]; then check rclone-download warn "no curl or wget yet; attach installs curl with $PM first"
+  else check rclone-download fail "no curl, wget or package manager to download rclone"; fi
+fi
+# Check storage from inside the sandbox: its firewall and DNS, not the host's.
+if [ -n "$RC" ]; then
+  out=$(timeout 45 "$RC" lsf ${q(options.remotePath)} --max-depth 1 --contimeout 10s --timeout 20s --retries 1 --low-level-retries 1 2>&1 >/dev/null); st=$?
+  # Exit 3 is "directory not found": reachable and authorized, just no volumes yet.
+  if [ "$st" = 0 ] || [ "$st" = 3 ]; then check storage ok "rclone listed the namespace from inside the sandbox"
+  else check storage fail "rclone exited $st: $(printf '%s\\n' "$out" | grep -v '^[[:space:]]*$' | tail -n 1)"; fi
+elif have curl; then
+  EP=${q(options.endpointUrl)}
+  code=$(http_code "$EP")
+  case "$code" in ''|000) check storage fail "no answer from $EP";; *) check storage warn "$EP answered HTTP $code; credentials are checked once rclone is installed";; esac
+else check storage warn "cannot test from inside the sandbox until rclone or curl is installed"; fi
+d="$CACHE_ROOT"; while [ ! -d "$d" ] && [ "$d" != / ]; do d=\${d%/*}; [ -n "$d" ] || d=/; done
+kb=$(df -Pk "$d" 2>/dev/null | awk 'NR == 2 { print $4 }')
+case "$kb" in
+  ''|*[!0-9]*) check cache-disk warn "free space under $d is unknown";;
+  *) if [ "$kb" -lt 1048576 ]; then check cache-disk warn "$((kb / 1024)) MiB free under $d for the write cache"; else check cache-disk ok "$((kb / 1048576)) GiB free under $d for the write cache"; fi;;
+esac
+echo "FSVOL_RESULT status=checked"
+`;
+}
+
+export interface GuestMountListing {
+  mounts: Array<{ mountId: string; mounted: boolean; alive: boolean; pid: number | null; readOnly: boolean | null; state: Record<string, unknown> | null }>;
+  unmanaged: string[];
+}
+
+export function parseMountListing(stdout: string): GuestMountListing {
+  const listing: GuestMountListing = { mounts: [], unmanaged: [] };
+  for (const raw of stdout.split('\n')) {
+    const line = raw.replace(/\r$/, '');
+    const mount = /^FSVOL_MOUNT mid=([0-9a-f]+) mounted=([01]) alive=([01]) pid=([0-9]*) ro=([01]?) state=(.*)$/.exec(line);
+    if (mount) {
+      let state: Record<string, unknown> | null = null;
+      try {
+        const parsed: unknown = JSON.parse(mount[6]!);
+        if (parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed)) state = parsed as Record<string, unknown>;
+      } catch {
+        state = null;
+      }
+      listing.mounts.push({
+        mountId: mount[1]!,
+        mounted: mount[2] === '1',
+        alive: mount[3] === '1',
+        pid: mount[4] ? Number(mount[4]) : null,
+        readOnly: mount[5] === '1' ? true : mount[5] === '0' ? false : null,
+        state,
+      });
+    } else if (line.startsWith('FSVOL_UNMANAGED ')) {
+      listing.unmanaged.push(line.slice('FSVOL_UNMANAGED '.length));
+    }
+  }
+  return listing;
+}
+
+export type GuestCheckStatus = 'ok' | 'warn' | 'fail';
+
+export function parseChecks(stdout: string): Array<{ name: string; status: GuestCheckStatus; detail: string }> {
+  const checks: Array<{ name: string; status: GuestCheckStatus; detail: string }> = [];
+  for (const raw of stdout.split('\n')) {
+    const match = /^FSVOL_CHECK ([a-z-]+) (ok|warn|fail) ?(.*)$/.exec(raw.replace(/\r$/, ''));
+    if (match) checks.push({ name: match[1]!, status: match[2] as GuestCheckStatus, detail: match[3] ?? '' });
+  }
+  return checks;
+}
+
 function toInt(value: string | undefined): number | null {
   if (value === undefined || value === '') return null;
   const n = Number(value);
@@ -697,6 +838,25 @@ export class RcloneBackend {
       stats: parseVfsStats(out.blocks.STATS) ?? null,
       logTail: out.blocks.LOG ?? [],
     };
+  }
+
+  async listMounts(sandbox: SandboxRuntime, options: { timeoutMs: number }): Promise<GuestMountListing> {
+    const run = await runGuest(sandbox, { label: 'list', script: listMountsScript(this.paths), timeoutMs: options.timeoutMs });
+    const out = parseGuestOutput(run.stdout);
+    if (out.error || run.exitCode !== 0 || out.result?.status !== 'listed') {
+      throw new MountError('MOUNT_FAILED', `Listing the mounts in sandbox "${sandbox.id}" failed.`, { details: guestFailure(run, out, sandbox.id) });
+    }
+    return parseMountListing(run.stdout);
+  }
+
+  /** Runs {@link checkScript}; `env` carries the storage credentials, as for a mount. */
+  async check(sandbox: SandboxRuntime, env: Record<string, string>, options: GuestCheckOptions & { timeoutMs: number }): Promise<Array<{ name: string; status: GuestCheckStatus; detail: string }>> {
+    const run = await runGuest(sandbox, { label: 'check', script: checkScript(this.paths, options), env, timeoutMs: options.timeoutMs });
+    const out = parseGuestOutput(run.stdout);
+    if (out.error || run.exitCode !== 0 || out.result?.status !== 'checked') {
+      throw new SandboxError('SANDBOX_EXEC', `The preflight check in sandbox "${sandbox.id}" did not complete (exit ${run.exitCode}).`, { details: guestFailure(run, out, sandbox.id) });
+    }
+    return parseChecks(run.stdout);
   }
 
   async unmount(sandbox: SandboxRuntime, options: { mountPath: string; flushTimeoutMs: number; force: boolean; timeoutMs: number }): Promise<GuestDetachResult> {

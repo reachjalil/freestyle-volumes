@@ -2,7 +2,7 @@
 
 ## Current verification status
 
-Pre-release run for 0.2.0 — **2026-09-25**: `pnpm test`: 127 passed, 0 skipped; `pnpm check:types`, `pnpm check:examples` and `pnpm test:package` passed; `VOLUMES_TEST_BOOTSTRAP=1 pnpm test:integration`: 28 passed, 0 failed, 0 skipped on Docker. `pnpm test:freestyle`: 2 skipped because no Freestyle key or bucket was configured. **No live Freestyle round trip, snapshot build or pause/resume has been validated.** Neither the Docker results nor the local host clone/list benchmark is Freestyle runtime evidence. See [verification](evidence/v0.2.md) (earlier runs in [v0.1](evidence/v0.1.md)), [performance](performance.md) and [source-linked research](freestyle-research.md).
+Pre-release run for 0.2.0 — **2026-09-25**: `pnpm test`: 146 passed, 0 skipped; `pnpm check:types`, `pnpm check:examples` and `pnpm test:package` passed; `VOLUMES_TEST_BOOTSTRAP=1 pnpm test:integration`: 33 passed, 0 failed, 0 skipped on Docker. `pnpm test:freestyle`: 2 skipped because no Freestyle key or bucket was configured. **No live Freestyle round trip, snapshot build or pause/resume has been validated.** Neither the Docker results nor the local host clone/list benchmark is Freestyle runtime evidence. See [verification](evidence/v0.2.md) (earlier runs in [v0.1](evidence/v0.1.md)), [performance](performance.md) and [source-linked research](freestyle-research.md).
 
 ## Facts taken from Freestyle's documentation and SDK (`freestyle@0.2.14`)
 
@@ -62,10 +62,11 @@ The tests print every `onEvent` line and delete what they created in `finally` b
 
 ## Operational notes
 
+- Run `checkSandbox({ sandboxId })` (CLI: `freestyle-volumes doctor --vm <vm-id>`) whenever you change the base snapshot or the firewall. It tests the VM's own path to the bucket with your credentials, which a check from your machine cannot prove.
 - Attach with `uid: 1000, gid: 1000` so the `ubuntu` user owns files; the mount is `allow_other` either way.
-- Keep `detach()` in your VM shutdown path and require `flushed: true` before discarding recoverable cache. Normal detach unmounts externally, waits for FUSE serving to stop, drains the VFS retained by `rclone rcd`, then stops the process. Deleting a VM with pending uploads loses them.
+- Keep `detachAll({ sandboxId })` in your VM shutdown path and delete the VM only when it returns `flushed: true`; it detaches every managed mount, including ones your code lost track of, and reports each failure instead of stopping at the first. Normal detach unmounts externally, waits for FUSE serving to stop, drains the VFS retained by `rclone rcd`, then stops the process. Deleting a VM with pending uploads loses them. `listMounts({ sandboxId })` shows what is mounted, stale or unmanaged at any time.
 - After `FLUSH_FAILED`, the filesystem may already be unmounted while the uploader/cache/state remain: restore storage access and retry detach. Forced uncertain detach retains cache/state and the advisory attachment record; it is not a durability guarantee.
 - Reattach recovery requires the same full storage and mount identity. Legacy state without ownership evidence or using old cache ids is not automatically migrated and can require operator intervention. Guest lifecycle locks and symlink rejection do not replace application orchestration of distributed attach/delete races.
-- Snapshots taken while a volume is attached contain the rclone process (with credentials in its environment) and the write cache. Detach first.
+- Snapshots taken while a volume is attached contain the rclone process (with credentials in its environment) and the write cache. Run `detachAll` first.
 - Freestyle's exec limit is 300 s. `bootstrapTimeoutMs` (240 s), `readyTimeoutMs` (30 s) and `flushTimeoutMs` (60 s) are bounded so no single step can exceed it.
 - The same library works for Docker containers (`dockerSandboxes()`), which is how the integration suite runs without a Freestyle account.

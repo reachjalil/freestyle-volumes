@@ -167,6 +167,95 @@ export interface DetachResult {
   warnings: string[];
 }
 
+export interface ListMountsOptions {
+  sandboxId: string;
+  timeoutMs?: number;
+}
+
+export interface MountSummary {
+  /** `mounted`: healthy. `stale`: a state record without a healthy mount (crash, restart, or recovery data retained by a failed or forced detach). */
+  status: 'mounted' | 'stale';
+  /** Null when the state record is unreadable; inspect it in the sandbox. */
+  mountPath: string | null;
+  volumeId: string | null;
+  subpath: string | null;
+  readOnly: boolean | null;
+  mountId: string;
+  pid: number | null;
+  startedAt: string | null;
+}
+
+export interface MountListing {
+  sandboxId: string;
+  /** Every mount this library manages in the sandbox, sorted by mount path. */
+  mounts: MountSummary[];
+  /** rclone mounts that this library did not create. They are never touched. */
+  unmanaged: string[];
+}
+
+export interface DetachAllOptions {
+  sandboxId: string;
+  flushTimeoutMs?: number;
+  /** Passed to every detach; see {@link DetachVolumeOptions.force}. */
+  force?: boolean;
+}
+
+/** A mount that `detachAll` could not detach. Its recovery state, cache and advisory record are retained. */
+export interface DetachFailure {
+  status: 'failed';
+  sandboxId: string;
+  mountPath: string | null;
+  volumeId: string | null;
+  flushed: false;
+  pendingUploads: null;
+  warnings: string[];
+  error: { code: string; message: string };
+}
+
+export interface DetachAllResult {
+  sandboxId: string;
+  /** True when every managed mount was detached with a verified flush or was already gone: nothing unflushed is left in the sandbox. */
+  flushed: boolean;
+  results: Array<DetachResult | DetachFailure>;
+  /** rclone mounts this library did not create; left alone. */
+  unmanaged: string[];
+}
+
+export type CheckStatus = 'ok' | 'warn' | 'fail';
+
+export interface CheckResult {
+  name: string;
+  status: CheckStatus;
+  detail: string;
+  /** The next step when the status is `warn` or `fail`. */
+  hint?: string;
+}
+
+export interface CheckReport {
+  /** False when any check failed. Warnings are work attach will do, such as installing rclone, or checks that cannot run yet. */
+  ok: boolean;
+  checks: CheckResult[];
+}
+
+export interface CheckSandboxOptions {
+  sandboxId: string;
+  /** Default 120000 ms; the check makes network probes from inside the sandbox. */
+  timeoutMs?: number;
+}
+
+const SANDBOX_CHECK_HINTS: Record<string, string> = {
+  'arch:fail': 'Only x86_64 and aarch64 sandboxes are supported.',
+  'root:fail': 'Run the scripts as root, the default linuxUser of freestyleSandboxes().',
+  'fuse-device:fail': 'Freestyle Ubuntu VMs expose /dev/fuse. A Docker container needs --device /dev/fuse --cap-add SYS_ADMIN.',
+  'fusermount:fail': 'Use an image with apt-get or apk, or preinstall fuse3.',
+  'flock:fail': 'Use an image with apt-get or apk, or preinstall util-linux.',
+  'rclone:warn': 'Boot from a volume-ready snapshot (createVolumeReadySnapshot or `freestyle-volumes prepare-snapshot`) to skip the download on attach.',
+  'rclone-download:fail': 'Allow outbound HTTPS to downloads.rclone.org in the VM firewall, or boot from a volume-ready snapshot.',
+  'storage:fail': 'If checkStorage passes from this process, the VM cannot reach the bucket: allow outbound traffic to the storage endpoint in the VM firewall, and set storage.sandboxEndpoint when the VM reaches storage at a different address.',
+  'storage:warn': 'Credentials are verified from inside the VM once rclone is installed.',
+  'cache-disk:warn': 'Pending writes are cached on the VM disk; set cacheMaxSize or use a larger VM.',
+};
+
 export interface DeleteVolumeOptions {
   volumeId: string;
   /** Must equal `volumeId`. Deleting destroys every object under the volume's data prefix. */
@@ -374,6 +463,102 @@ export class FreestyleVolumes {
       pendingUploads: guest.pending,
       warnings,
     };
+  }
+
+  /**
+   * Every mount this library manages in a sandbox, healthy or stale, plus rclone
+   * mounts it did not create. A point-in-time view: no locks are taken.
+   */
+  async listMounts(options: ListMountsOptions): Promise<MountListing> {
+    const sandboxId = assertSandboxId(options.sandboxId);
+    const timeoutMs = assertInteger('timeoutMs', options.timeoutMs ?? this.defaults.inspectTimeoutMs, 1000, MAX_EXEC_MS);
+    const sandbox = await this.sandboxes.get(sandboxId);
+    const guest = await this.backend.listMounts(sandbox, { timeoutMs });
+    const mounts = guest.mounts.map((mount): MountSummary => {
+      const state = mount.state ?? {};
+      return {
+        status: mount.mounted && mount.alive ? 'mounted' : 'stale',
+        mountPath: mountPathOrNull(state.mountPath),
+        volumeId: typeof state.volumeId === 'string' ? state.volumeId : null,
+        subpath: typeof state.subpath === 'string' ? state.subpath : null,
+        readOnly: mount.readOnly ?? (typeof state.readOnly === 'boolean' ? state.readOnly : null),
+        mountId: mount.mountId,
+        pid: mount.alive ? mount.pid : null,
+        startedAt: typeof state.startedAt === 'string' ? state.startedAt : null,
+      };
+    });
+    mounts.sort((a, b) => (a.mountPath ?? '').localeCompare(b.mountPath ?? '') || a.mountId.localeCompare(b.mountId));
+    return { sandboxId, mounts, unmanaged: [...guest.unmanaged].sort() };
+  }
+
+  /**
+   * Detach every managed mount in a sandbox, one after another, before the VM
+   * is deleted or snapshotted. Never throws for an individual mount: failures
+   * are reported in `results`, with their recovery data retained, and
+   * `flushed` is true only when nothing unflushed is left behind.
+   */
+  async detachAll(options: DetachAllOptions): Promise<DetachAllResult> {
+    const sandboxId = assertSandboxId(options.sandboxId);
+    if (options.flushTimeoutMs !== undefined) assertInteger('flushTimeoutMs', options.flushTimeoutMs, 1000, MAX_EXEC_MS - 40_000);
+    const listing = await this.listMounts({ sandboxId });
+    const results: Array<DetachResult | DetachFailure> = [];
+    for (const mount of listing.mounts) {
+      const failure = (code: string, message: string): DetachFailure => ({
+        status: 'failed', sandboxId, mountPath: mount.mountPath, volumeId: mount.volumeId, flushed: false, pendingUploads: null, warnings: [], error: { code, message },
+      });
+      if (mount.mountPath === null) {
+        results.push(failure('MOUNT_STALE', `State record ${mount.mountId} has no valid mount path; inspect ${this.backend.paths.stateRoot}/mounts/${mount.mountId} in the sandbox.`));
+        continue;
+      }
+      const detachOptions: DetachVolumeOptions = { sandboxId, mountPath: mount.mountPath, force: options.force === true };
+      if (options.flushTimeoutMs !== undefined) detachOptions.flushTimeoutMs = options.flushTimeoutMs;
+      try {
+        results.push(await this.detach(detachOptions));
+      } catch (error) {
+        results.push(failure(error instanceof VolumeError ? error.code : 'UNKNOWN', error instanceof Error ? error.message : String(error)));
+      }
+    }
+    const flushed = results.every((result) => result.status === 'absent' || (result.status === 'detached' && result.flushed));
+    return { sandboxId, flushed, results, unmanaged: listing.unmanaged };
+  }
+
+  /**
+   * Preflight the bucket from this process: reachability, listing, atomic
+   * conditional creation, read-back and delete, using one short-lived probe
+   * object under `<prefix>/_doctor/`. Never throws for a failed check.
+   */
+  async checkStorage(): Promise<CheckReport> {
+    const checks: CheckResult[] = await this.registry.checkStore();
+    return { ok: checks.every((check) => check.status !== 'fail'), checks };
+  }
+
+  /**
+   * Preflight a sandbox without changing it: CPU, root, /dev/fuse, fusermount,
+   * flock and rclone (or whether attach can install them), whether the sandbox
+   * can reach the bucket with these credentials, and cache disk space.
+   */
+  async checkSandbox(options: CheckSandboxOptions): Promise<CheckReport> {
+    const sandboxId = assertSandboxId(options.sandboxId);
+    const timeoutMs = assertInteger('timeoutMs', options.timeoutMs ?? 120_000, 1000, MAX_EXEC_MS);
+    const sandbox = await this.sandboxes.get(sandboxId);
+    const guest = await this.backend.check(sandbox, rcloneRemoteEnv(this.storage), {
+      remotePath: `${RCLONE_REMOTE}:${this.storage.bucket}/${this.storage.prefix}`,
+      endpointUrl: this.storage.sandboxEndpoint ?? `https://s3.${this.storage.region}.amazonaws.com`,
+      timeoutMs,
+    });
+    const checks = guest.map((check): CheckResult => {
+      const hint = SANDBOX_CHECK_HINTS[`${check.name}:${check.status}`];
+      return hint === undefined ? check : { ...check, hint };
+    });
+    return { ok: checks.every((check) => check.status !== 'fail'), checks };
+  }
+}
+
+function mountPathOrNull(value: unknown): string | null {
+  try {
+    return assertMountPath(value);
+  } catch {
+    return null;
   }
 }
 

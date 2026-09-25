@@ -9,8 +9,8 @@ import { dockerSandboxes } from './docker.js';
 import { isVolumeError } from './errors.js';
 import { createVolumeReadySnapshot, freestyleSandboxes, type FreestyleClientLike, type FreestyleSnapshotClientLike } from './freestyle.js';
 import type { SandboxResolver } from './sandbox.js';
-import type { ObjectStore, StorageConfig } from './storage.js';
-import { FreestyleVolumes, type AttachVolumeOptions } from './volumes.js';
+import { storageConfigFromEnv, type ObjectStore } from './storage.js';
+import { FreestyleVolumes, type AttachVolumeOptions, type CheckReport, type DetachAllOptions, type DetachAllResult } from './volumes.js';
 
 type Env = Record<string, string | undefined>;
 type Options = NonNullable<ParseArgsConfig['options']>;
@@ -44,6 +44,8 @@ interface Command {
   positionals: string[];
   options?: Options;
   run(context: Context, args: string[]): Promise<unknown>;
+  /** Exit code for a result that was printed; default 0. */
+  exitCode?(result: unknown): number;
 }
 
 const GLOBAL_OPTIONS: Options = {
@@ -166,6 +168,50 @@ const COMMANDS: Record<string, Command> = {
       return result;
     },
   },
+  mounts: {
+    usage: 'mounts <vm>',
+    summary: 'List the mounts this library manages in a VM, healthy or stale.',
+    positionals: ['vm'],
+    run: async (context, [sandboxId]) => (await volumesFor(context, true)).listMounts({ sandboxId: sandboxId! }),
+  },
+  'detach-all': {
+    usage: 'detach-all <vm> [--flush-timeout <ms>] [--force]',
+    summary: 'Detach every managed mount in a VM, e.g. before deleting it.',
+    positionals: ['vm'],
+    options: { 'flush-timeout': { type: 'string' }, force: { type: 'boolean' } },
+    run: async (context, [sandboxId]) => {
+      const options: DetachAllOptions = { sandboxId: sandboxId!, force: context.values.force === true };
+      const flushTimeoutMs = integer(context.values, 'flush-timeout');
+      if (flushTimeoutMs !== undefined) options.flushTimeoutMs = flushTimeoutMs;
+      const result = await (await volumesFor(context, true)).detachAll(options);
+      for (const entry of result.results) {
+        if (entry.status === 'failed') context.stderr(`error: ${entry.mountPath ?? 'unreadable state'}: ${entry.error.code}: ${entry.error.message}\n`);
+        else if (entry.status === 'detached' && !entry.flushed) context.stderr(`warning: ${entry.mountPath} detached without a verified flush; its pending uploads stay in the sandbox cache.\n`);
+      }
+      return result;
+    },
+    exitCode: (result) => ((result as DetachAllResult).results.some((entry) => entry.status === 'failed') ? 1 : 0),
+  },
+  doctor: {
+    usage: 'doctor [--vm <vm>]',
+    summary: 'Check the bucket, and with --vm a VM, before the first attach.',
+    positionals: [],
+    options: { vm: { type: 'string' } },
+    run: async (context) => {
+      const vm = typeof context.values.vm === 'string' ? context.values.vm : undefined;
+      const volumes = await volumesFor(context, vm !== undefined);
+      const storage = await volumes.checkStorage();
+      printChecks(context, 'storage', storage);
+      const report: { ok: boolean; storage: CheckReport; sandbox?: CheckReport } = { ok: storage.ok, storage };
+      if (vm !== undefined) {
+        report.sandbox = await volumes.checkSandbox({ sandboxId: vm });
+        report.ok = report.ok && report.sandbox.ok;
+        printChecks(context, vm, report.sandbox);
+      }
+      return report;
+    },
+    exitCode: (result) => ((result as { ok: boolean }).ok ? 0 : 1),
+  },
   'prepare-snapshot': {
     usage: 'prepare-snapshot [--base <snapshot>] [--slug <slug>] [--name <display name>]',
     summary: 'Build a Freestyle snapshot with fuse3 and rclone preinstalled.',
@@ -194,7 +240,7 @@ const ENVIRONMENT = `Environment:
   VOLUMES_S3_PROVIDER           rclone hint: AWS, Cloudflare, Minio, Ceph, Other
   VOLUMES_S3_FORCE_PATH_STYLE   true or false; default true with an endpoint
   VOLUMES_S3_SESSION_TOKEN      for temporary credentials
-  FREESTYLE_API_KEY             for attach, inspect, detach, prepare-snapshot`;
+  FREESTYLE_API_KEY             for every command that takes a VM`;
 
 function helpText(version: string): string {
   const commands = Object.values(COMMANDS).map((command) => `  ${command.usage}\n      ${command.summary}`).join('\n');
@@ -224,6 +270,16 @@ Every command prints JSON on stdout and progress on stderr.
 Exit codes: 0 success, 1 operation failed, 2 usage or configuration error.
 Docs: https://github.com/reachjalil/freestyle-volumes#readme
 `;
+}
+
+/** A readable checklist on stderr; the JSON report goes to stdout. */
+function printChecks(context: Context, scope: string, report: CheckReport): void {
+  if (context.values.quiet === true) return;
+  for (const check of report.checks) {
+    const mark = check.status === 'ok' ? 'ok  ' : check.status === 'warn' ? 'warn' : 'FAIL';
+    context.stderr(`${mark} ${scope} ${check.name}: ${check.detail}\n`);
+    if (check.hint) context.stderr(`     ${check.hint}\n`);
+  }
 }
 
 /** Join items with spaces, breaking lines between items only. */
@@ -290,25 +346,6 @@ function readEnvFile(path: string): Env {
   return parseEnv(text);
 }
 
-function storageFromEnv(env: Env, prefix: string | undefined): StorageConfig {
-  const missing = ['VOLUMES_S3_BUCKET', 'VOLUMES_S3_ACCESS_KEY_ID', 'VOLUMES_S3_SECRET_ACCESS_KEY'].filter((key) => !env[key]);
-  if (missing.length > 0) throw new UsageError(`Missing ${missing.join(', ')}. Set them in the environment or pass --env-file <path>.`);
-  const storage: StorageConfig = { bucket: env.VOLUMES_S3_BUCKET!, accessKeyId: env.VOLUMES_S3_ACCESS_KEY_ID!, secretAccessKey: env.VOLUMES_S3_SECRET_ACCESS_KEY! };
-  if (env.VOLUMES_S3_ENDPOINT) storage.endpoint = env.VOLUMES_S3_ENDPOINT;
-  if (env.VOLUMES_S3_SANDBOX_ENDPOINT) storage.sandboxEndpoint = env.VOLUMES_S3_SANDBOX_ENDPOINT;
-  if (env.VOLUMES_S3_REGION) storage.region = env.VOLUMES_S3_REGION;
-  if (env.VOLUMES_S3_PROVIDER) storage.provider = env.VOLUMES_S3_PROVIDER;
-  if (env.VOLUMES_S3_SESSION_TOKEN) storage.sessionToken = env.VOLUMES_S3_SESSION_TOKEN;
-  const namespace = prefix ?? env.VOLUMES_S3_PREFIX;
-  if (namespace) storage.prefix = namespace;
-  const pathStyle = env.VOLUMES_S3_FORCE_PATH_STYLE;
-  if (pathStyle) {
-    if (!['true', 'false', '1', '0'].includes(pathStyle)) throw new UsageError('VOLUMES_S3_FORCE_PATH_STYLE must be true or false.');
-    storage.forcePathStyle = pathStyle === 'true' || pathStyle === '1';
-  }
-  return storage;
-}
-
 async function freestyleClient(context: Context): Promise<FreestyleClientLike & FreestyleSnapshotClientLike> {
   if (context.io.freestyle) return context.io.freestyle;
   const apiKey = context.env.FREESTYLE_API_KEY;
@@ -326,7 +363,8 @@ async function freestyleClient(context: Context): Promise<FreestyleClientLike & 
 }
 
 async function volumesFor(context: Context, needsSandbox = false): Promise<FreestyleVolumes> {
-  const storage = storageFromEnv(context.env, typeof context.values.prefix === 'string' ? context.values.prefix : undefined);
+  const storage = storageConfigFromEnv(context.env);
+  if (typeof context.values.prefix === 'string') storage.prefix = context.values.prefix;
   let sandboxes: SandboxResolver;
   if (context.io.sandboxes) sandboxes = context.io.sandboxes;
   else if (context.values.docker === true) sandboxes = dockerSandboxes();
@@ -396,7 +434,7 @@ export async function runCli(argv: string[], io: CliIo = {}): Promise<number> {
     const env = mergeEnv(typeof envFile === 'string' ? readEnvFile(envFile) : {}, io.env ?? process.env);
     const result = await command.run({ env, io, values, stderr: err }, args);
     out(`${JSON.stringify(result, null, 2)}\n`);
-    return 0;
+    return command.exitCode?.(result) ?? 0;
   } catch (error) {
     if (error instanceof UsageError || isParseArgsError(error)) {
       err(`freestyle-volumes: ${(error as Error).message}\n`);

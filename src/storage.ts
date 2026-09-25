@@ -92,6 +92,36 @@ export function resolveStorage(config: StorageConfig): ResolvedStorage {
 }
 
 /**
+ * Storage configuration from the `VOLUMES_S3_*` environment variables that the
+ * CLI, the examples and the live tests share (see `.env.example`). Empty
+ * variables count as unset. Throws a {@link ValidationError} naming every
+ * missing required variable; the values themselves are validated later by
+ * {@link resolveStorage}.
+ *
+ * @example
+ * const volumes = new FreestyleVolumes({ storage: storageConfigFromEnv(), sandboxes: freestyleSandboxes(freestyle) });
+ */
+export function storageConfigFromEnv(env: Record<string, string | undefined> = process.env): StorageConfig {
+  const missing = ['VOLUMES_S3_BUCKET', 'VOLUMES_S3_ACCESS_KEY_ID', 'VOLUMES_S3_SECRET_ACCESS_KEY'].filter((key) => !env[key]);
+  if (missing.length > 0) {
+    throw new ValidationError(`Missing environment variables: ${missing.join(', ')}.`, { hint: 'Every VOLUMES_S3_* variable is listed in .env.example.' });
+  }
+  const config: StorageConfig = { bucket: env.VOLUMES_S3_BUCKET!, accessKeyId: env.VOLUMES_S3_ACCESS_KEY_ID!, secretAccessKey: env.VOLUMES_S3_SECRET_ACCESS_KEY! };
+  if (env.VOLUMES_S3_ENDPOINT) config.endpoint = env.VOLUMES_S3_ENDPOINT;
+  if (env.VOLUMES_S3_SANDBOX_ENDPOINT) config.sandboxEndpoint = env.VOLUMES_S3_SANDBOX_ENDPOINT;
+  if (env.VOLUMES_S3_REGION) config.region = env.VOLUMES_S3_REGION;
+  if (env.VOLUMES_S3_PREFIX) config.prefix = env.VOLUMES_S3_PREFIX;
+  if (env.VOLUMES_S3_PROVIDER) config.provider = env.VOLUMES_S3_PROVIDER;
+  if (env.VOLUMES_S3_SESSION_TOKEN) config.sessionToken = env.VOLUMES_S3_SESSION_TOKEN;
+  const pathStyle = env.VOLUMES_S3_FORCE_PATH_STYLE;
+  if (pathStyle) {
+    if (!['true', 'false', '1', '0'].includes(pathStyle)) throw new ValidationError(`VOLUMES_S3_FORCE_PATH_STYLE must be true or false, got ${JSON.stringify(pathStyle)}.`);
+    config.forcePathStyle = pathStyle === 'true' || pathStyle === '1';
+  }
+  return config;
+}
+
+/**
  * Environment variables that define the rclone remote inside the sandbox.
  * Credentials travel only this way: never on a command line, never in a file.
  */

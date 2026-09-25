@@ -9,6 +9,7 @@
  *   v/<id>/...                               the volume's data (mounted by rclone)
  *   v2/<id>/<generation>/...                 isolated data for new volumes
  *   _operations/<operationId>.json           immutable clone ownership intent
+ *   _doctor/<uuid>.json                      short-lived probe written and deleted by checkStore
  */
 import { VolumeAlreadyExistsError, VolumeError, VolumeNotFoundError, ValidationError } from './errors.js';
 import { randomUUID } from 'node:crypto';
@@ -74,6 +75,20 @@ export interface AttachmentRecord {
 const RECORD_VERSION = 1;
 const GENERATION = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const LABEL_KEY = /^[A-Za-z0-9][A-Za-z0-9._/-]{0,62}$/;
+
+/** One result of {@link VolumeRegistry.checkStore}. */
+export interface StoreCheck {
+  name: string;
+  status: 'ok' | 'fail';
+  detail: string;
+  hint?: string;
+}
+
+/** Storage errors are already sanitized; never include credentials here. */
+function describeError(error: unknown): string {
+  if (error instanceof VolumeError) return `${error.code}: ${error.message}`;
+  return error instanceof Error ? error.message : String(error);
+}
 
 function validateLabels(labels: Record<string, string> | undefined): Record<string, string> {
   if (labels !== undefined && !isRecord(labels)) throw new ValidationError('Labels must be an object of strings.');
@@ -330,6 +345,65 @@ export class VolumeRegistry {
     }
     await readBatch();
     return volumes.sort((a, b) => a.name.localeCompare(b.name));
+  }
+
+  /**
+   * Probe what the registry needs from the object store: the bucket, listing,
+   * atomic conditional creation (the provider must reject `If-None-Match: *`
+   * over an existing key), read-back and delete. Writes one probe object under
+   * `_doctor/` and deletes it again. Stops after a failed bucket or list check.
+   */
+  async checkStore(): Promise<StoreCheck[]> {
+    const checks: StoreCheck[] = [];
+    const ok = (name: string, detail: string) => checks.push({ name, status: 'ok', detail });
+    const fail = (name: string, detail: string, hint?: string) => checks.push(hint === undefined ? { name, status: 'fail', detail } : { name, status: 'fail', detail, hint });
+    try {
+      await this.store.headBucket();
+      ok('bucket', 'The bucket exists and these credentials can reach it.');
+    } catch (error) {
+      fail('bucket', describeError(error));
+      return checks;
+    }
+    try {
+      for await (const _object of this.store.listObjects(`${this.prefix}/`, { limit: 1 })) break;
+      ok('list', `Listing ${this.prefix}/ works.`);
+    } catch (error) {
+      fail('list', describeError(error), 'The credentials need ListBucket on the namespace prefix.');
+      return checks;
+    }
+    const key = `${this.prefix}/_doctor/${randomUUID()}.json`;
+    const first = JSON.stringify({ probe: 'freestyle-volumes', write: 1 });
+    let written = false;
+    try {
+      if (!(await this.store.putObjectIfAbsent(key, first))) {
+        fail('conditional-create', 'A new probe key was reported as already existing.');
+      } else {
+        written = true;
+        if (await this.store.putObjectIfAbsent(key, JSON.stringify({ probe: 'freestyle-volumes', write: 2 }))) {
+          fail('conditional-create', 'The store accepted a conditional create over an existing object: it does not enforce If-None-Match, so two clients creating one volume at once could overwrite each other.', 'Use a provider (or version) that rejects PutObject with If-None-Match: * when the key exists.');
+        } else {
+          ok('conditional-create', 'Conditional creates are enforced: a second create of the same key was rejected.');
+        }
+      }
+    } catch (error) {
+      fail('conditional-create', describeError(error), 'Creating volumes needs PutObject with If-None-Match: *; this provider or its configuration rejected it.');
+    }
+    if (written) {
+      try {
+        const body = await this.store.getObject(key);
+        if (body === first) ok('read', 'The probe object read back unchanged.');
+        else fail('read', body === undefined ? 'The probe object could not be read right after it was written.' : 'The probe object changed after it was written.');
+      } catch (error) {
+        fail('read', describeError(error));
+      }
+      try {
+        await this.store.deleteObject(key);
+        ok('delete', 'Deleting the probe object works.');
+      } catch (error) {
+        fail('delete', describeError(error), `Deleting volumes needs DeleteObject. Remove ${key} by hand.`);
+      }
+    }
+    return checks;
   }
 
   /** Cheap reachability and permission check against a data prefix (one LIST call). */
