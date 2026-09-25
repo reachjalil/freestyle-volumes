@@ -4,7 +4,7 @@
 import { test, describe, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { FreestyleVolumes, dockerSandboxes, scopedPolicy } from '../../dist/index.js';
-import { Stack, docker, dockerAvailable, waitFor } from '../helpers/stack.mjs';
+import { Stack, dockerAvailable, waitFor } from '../helpers/stack.mjs';
 
 if (!dockerAvailable()) {
   test('operations integration tests (skipped: Docker is not available or VOLUMES_SKIP_INTEGRATION=1)', { skip: true }, () => {});
@@ -17,13 +17,10 @@ if (!dockerAvailable()) {
 
     /** A MinIO user whose only policy is scopedPolicy() for one key prefix. */
     function scopedUser(name, keyPrefix, readOnly) {
-      const mcHost = `MC_HOST_local=http://${stack.accessKeyId}:${stack.secretAccessKey}@localhost:9000`;
       const secret = `${name}-secret-0123456789`;
-      const policy = JSON.stringify(scopedPolicy({ bucket: stack.bucket, keyPrefix, readOnly }));
-      docker(['exec', stack.minio, 'sh', '-c', `printf '%s' '${policy}' > /tmp/${name}.json`]);
-      docker(['exec', '-e', mcHost, stack.minio, 'mc', 'admin', 'user', 'add', 'local', name, secret]);
-      docker(['exec', '-e', mcHost, stack.minio, 'mc', 'admin', 'policy', 'create', 'local', name, `/tmp/${name}.json`]);
-      docker(['exec', '-e', mcHost, stack.minio, 'mc', 'admin', 'policy', 'attach', 'local', name, '--user', name]);
+      stack.mc(['admin', 'user', 'add', 'local', name, secret]);
+      stack.mc(['admin', 'policy', 'create', 'local', name, '/dev/stdin'], { input: JSON.stringify(scopedPolicy({ bucket: stack.bucket, keyPrefix, readOnly })) });
+      stack.mc(['admin', 'policy', 'attach', 'local', name, '--user', name]);
       return { accessKeyId: name, secretAccessKey: secret };
     }
 

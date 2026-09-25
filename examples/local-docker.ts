@@ -1,7 +1,7 @@
 // Local development without a Freestyle account: a Docker container stands in
 // for the sandbox and MinIO for S3. Start them first:
 //   docker network create vols
-//   docker run -d --name minio --network vols -p 127.0.0.1:9000:9000 -e MINIO_ROOT_USER=admin -e MINIO_ROOT_PASSWORD=adminadmin quay.io/minio/minio server /data
+//   docker run -d --name minio --network vols -p 127.0.0.1:9000:9000 -e MINIO_ROOT_USER=admin -e MINIO_ROOT_PASSWORD=adminadmin cgr.dev/chainguard/minio server /data
 //   docker run -d --name sandbox --network vols --device /dev/fuse --cap-add SYS_ADMIN --security-opt apparmor:unconfined --entrypoint sh rclone/rclone -c 'sleep 3600'
 // and create the bucket "volumes" in MinIO (console at http://127.0.0.1:9000 or `mc mb`).
 import { FreestyleVolumes } from 'freestyle-volumes';

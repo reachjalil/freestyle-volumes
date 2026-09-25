@@ -7,7 +7,7 @@ Issues and pull requests are welcome at https://github.com/reachjalil/freestyle-
 ```bash
 pnpm install
 pnpm test                                   # unit tests
-pnpm test:integration                       # needs Docker; pulls quay.io/minio/minio and rclone/rclone
+pnpm test:integration                       # needs Docker; pulls cgr.dev/chainguard/minio, minio-client and rclone/rclone
 VOLUMES_TEST_BOOTSTRAP=1 pnpm test:integration   # also runs the bare ubuntu:24.04 bootstrap test (slow, needs internet)
 pnpm check:types && pnpm check:examples
 pnpm test:package                           # packs the tarball, installs it into a fresh project and uses it (needs the npm registry)
