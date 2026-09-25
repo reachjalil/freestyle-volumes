@@ -10,7 +10,8 @@
     "paths": {
       "freestyle-volumes": ["src/index.ts"],
       "freestyle-volumes/freestyle": ["src/freestyle.ts"],
-      "freestyle-volumes/docker": ["src/docker.ts"]
+      "freestyle-volumes/docker": ["src/docker.ts"],
+      "freestyle-volumes/git": ["src/git.ts"]
     }
   },
   "include": ["examples/*.ts"]

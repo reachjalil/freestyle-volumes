@@ -21,6 +21,9 @@ Storage configuration, sandbox integration and filesystem-process management are
 <prefix>/_volumes/<name>.json                     { version, id, name, createdAt, labels, backend, dataPrefix, generation? }
 <prefix>/_attachments/<name>/<sandbox>__<mount>.json   advisory: who mounted what, where, when
 <prefix>/_operations/<operationId>.json             immutable clone ownership intent (retained)
+<prefix>/_leases/<name>.json                         exclusive-writer lease, taken with a conditional create
+<prefix>/_deleting/<name>.json                       written before a delete starts, removed when it finishes
+<prefix>/_doctor/<uuid>.json                         short-lived checkStorage probe
 <prefix>/v/<name>/...                              legacy v1 files and directory markers
 <prefix>/v2/<name>/<generation>/...                 new v2 files and directory markers
 ```
@@ -75,9 +78,10 @@ Uncertain forced detaches retain state in `mounts/` alongside the cache, rather 
 ## Attach sequence
 
 1. Validate `sandboxId`, `volumeId`, `mountPath` (absolute, clean, outside protected roots), `subpath`, options.
-2. `GET` the volume record; `LIST` one key under the data prefix. Wrong credentials, a missing bucket or an unreachable endpoint fail here, before any sandbox call.
-3. Bootstrap script (no credentials): check `/dev/fuse`, install `fuse3`, rclone and `util-linux` when `flock` is missing, and verify tools. The bootstrap lock is used when `flock` is available; lifecycle scripts require it.
-4. Mount script (credentials in `env`):
+2. `GET` the volume record and refuse if its deleting marker matches (`VOLUME_DELETING`); `LIST` one key under the data prefix. Wrong credentials, a missing bucket or an unreachable endpoint fail here, before any sandbox call. An `exclusive` attach then takes the writer lease with a conditional create; a plain writable attach refuses while another mount holds it.
+3. With `sandboxCredentials`, ask for keys covering the mount's data prefix (read-only for read-only mounts). A provider failure stops the attach; the host's keys are never used as a fallback. These mounts set rclone's `no_head_object`, since a prefix-limited key may not HEAD the mount root.
+4. Bootstrap script (no credentials): check `/dev/fuse`, install `fuse3`, rclone and `util-linux` when `flock` is missing, and verify tools. The bootstrap lock is used when `flock` is available; lifecycle scripts require it.
+5. Mount script (credentials in `env`):
    - Reject symlink mount paths or ancestors, then take a nonblocking `flock` keyed by mount path, shared by attach, inspect and detach. Contention reports `lifecycle-busy`; persistent lock files are never unlinked.
    - A healthy mount must match stored mount identity, remote path and read-only mode, with verified process ownership, before returning `already=1`.
    - Refuse foreign identities, stale mounts or existing processes requiring detach; do not silently kill and replace them.
@@ -85,7 +89,7 @@ Uncertain forced detaches retain state in `mounts/` alongside the cache, rather 
    - Record PID, process start time and executable; ownership also requires the expected Unix socket argument. Never signal by PID alone.
    - Create the FUSE mount via RC `mount/mount` with `mountType=mount`. Poll for owned process, `fuse.rclone` entry and a successful directory listing within the readiness deadline.
    - On process exit, mount creation failure or timeout, report failure while retaining recovery state/cache; the process may still be running.
-5. Write the advisory attachment record (failure is a warning, the mount is already live).
+6. Write the advisory attachment record (failure is a warning, the mount is already live). The mount's options, lease flag and credential expiry go into its guest `mount.json`, so `restoreMounts` can reattach with the same settings. A lease taken by this call is released again if the attach failed before any mount could start, and kept (`details.leaseRetained`) when a mount may still come up.
 
 ## Detach sequence
 
@@ -96,7 +100,14 @@ Uncertain forced detaches retain state in `mounts/` alongside the cache, rather 
 5. Expedite `vfs/queue` entries and poll `vfs/stats` within the flush deadline. All three counters (queued, in-progress, errored) must be valid and zero. Missing or malformed counters are not proof of drain. This verification is required for read-only mounts too.
 6. `FLUSH_FAILED` may leave the filesystem unmounted with uploader, state and cache intact. Restore storage access and retry detach; an already-unmounted, quiesced uploader can still drain. Unverifiable drain reports stale unless force is requested.
 7. After verified drain, stop only the owned process (SIGTERM, then SIGKILL if necessary), verify mount/process cleanup, and remove cache/state. If cleanup is uncertain, refuse rather than discard evidence.
-8. Forced uncertain detach retains cache/state in place and marks the process stopped only after verified cleanup, returning `flushed: false`. The facade retains the advisory attachment record. Only a detached, verified-flushed result removes that record. Reattach with the same identity can resume retained uploads; rejected preflight must preserve recovery evidence.
+8. Forced uncertain detach retains cache/state in place and marks the process stopped only after verified cleanup, returning `flushed: false`. The facade retains the advisory attachment record and any writer lease. Only a detached, verified-flushed result removes that record and releases the lease this mount held. Reattach with the same identity can resume retained uploads; rejected preflight must preserve recovery evidence.
+
+## Flush, listing and discard
+
+- `flush` takes the mount-path lock, requires the verified owned uploader, expedites `vfs/queue` and polls `vfs/stats` until queued, in-flight and errored uploads are all zero or the deadline passes. It never unmounts or signals anything.
+- The listing script takes no lock. For each managed state record it reports mount and process status and, for a running uploader, its `vfs/stats` (`FSVOL_MSTATS`), so progress is visible while a detach or flush holds the lock.
+- `discard` takes the lock and refuses while the path is mounted, while the owned uploader runs, or while a live PID has no identity record; otherwise it deletes the state directory, the cache and the socket. The host then removes the attachment record and releases the lease that mount held.
+- `restoreMounts` lists stale mounts and attaches each with its saved options. A refusal because of a dead FUSE entry leads to a forced detach that keeps the cache, and one because of a still-running uploader leads to a normal, verified detach; then it attaches again.
 
 ## Guest protocol
 
@@ -129,3 +140,17 @@ The `fsvol` remote is defined entirely by `RCLONE_CONFIG_FSVOL_*` environment va
 | Flush | 60 s | `flushTimeoutMs` ≤ 260 s; exec limit is `flushTimeoutMs + 40 s` |
 
 Every exec stays within Freestyle's 300 s cap. A timed-out volume-runtime exec (`statusCode === null`) surfaces as `SANDBOX_EXEC_TIMEOUT`; the Git helper instead reports `GIT_TIMEOUT` and requires inspection before retrying.
+
+## Why rclone
+
+This is a shortlist of design tradeoffs for this preview, not an exhaustive or benchmark-ranked comparison. See the [source-linked research](freestyle-research.md) for the boundary between workspaces and artifacts.
+
+| Backend | Kind | License | Random writes | Metadata / extra service | Verdict |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **rclone mount** (chosen) | object-store mount with local write-back cache | MIT | Yes, buffered locally; whole object re-uploaded on close | Object listing only; empty dirs via markers; **no extra service** | Single static binary, S3-compatible endpoint/path-style support, and an RC API used by the verified-drain protocol. Similar category to Daytona's documented volumes. |
+| JuiceFS | POSIX-like distributed filesystem (chunked data in S3) | Apache-2.0 | Yes, chunk-level; atomic rename, locks, xattr | **Requires a metadata engine** (Redis, MySQL, PostgreSQL, TiKV, SQLite) reachable by every VM | Candidate when POSIX semantics justify an extra service. Planned as a second backend behind the same interface; not implemented. |
+| s3fs-fuse | object-store mount | GPL-2.0 | Whole-object rewrite | Object listing | Mature but GPL, no flush API, weaker rename semantics. |
+| Mountpoint for Amazon S3 | object-store mount, sequential writes only | Apache-2.0 | No edits of existing objects, no append | Object listing | Read-mostly workloads on AWS only. |
+| geesefs | object-store mount | Apache-2.0 | Partial (server-side part copies) | Object listing | Smaller community; kept as a candidate. |
+
+For a first release that people can point at any bucket without running a database, an object-store mount with honest, documented semantics beats a POSIX filesystem with a hidden dependency. The mount logic is isolated in [src/rclone.ts](../src/rclone.ts) so a JuiceFS backend can slot in.

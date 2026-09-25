@@ -1,0 +1,75 @@
+name: Freestyle live test
+# Creates real Freestyle VMs (billed to the account behind FREESTYLE_API_KEY)
+# and writes to a real bucket; everything it creates is deleted at the end.
+# Runs by hand, and weekly once the repository has the secrets, so a change on
+# the Freestyle side cannot break mounts unnoticed. Configure in Settings >
+# Secrets and variables > Actions:
+#   secrets:   FREESTYLE_API_KEY, VOLUMES_S3_ACCESS_KEY_ID, VOLUMES_S3_SECRET_ACCESS_KEY
+#   variables: VOLUMES_S3_BUCKET, and optionally VOLUMES_S3_ENDPOINT,
+#              VOLUMES_S3_REGION, VOLUMES_S3_PROVIDER
+on:
+  workflow_dispatch:
+    inputs:
+      snapshot:
+        description: Also build a volume-ready snapshot and attach from a VM booted from it
+        type: boolean
+        default: true
+      throughput:
+        description: Also run the throughput benchmark (writes about 300 MB)
+        type: boolean
+        default: false
+  schedule:
+    - cron: '17 6 * * 1' # Mondays 06:17 UTC
+permissions:
+  contents: read
+concurrency:
+  group: freestyle-live
+  cancel-in-progress: false
+jobs:
+  live:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      FREESTYLE_API_KEY: ${{ secrets.FREESTYLE_API_KEY }}
+      VOLUMES_S3_ACCESS_KEY_ID: ${{ secrets.VOLUMES_S3_ACCESS_KEY_ID }}
+      VOLUMES_S3_SECRET_ACCESS_KEY: ${{ secrets.VOLUMES_S3_SECRET_ACCESS_KEY }}
+      VOLUMES_S3_BUCKET: ${{ vars.VOLUMES_S3_BUCKET }}
+      VOLUMES_S3_ENDPOINT: ${{ vars.VOLUMES_S3_ENDPOINT }}
+      VOLUMES_S3_REGION: ${{ vars.VOLUMES_S3_REGION }}
+      VOLUMES_S3_PROVIDER: ${{ vars.VOLUMES_S3_PROVIDER }}
+      VOLUMES_S3_PREFIX: freestyle-volumes-live-${{ github.run_id }}
+      # Scheduled runs build the snapshot too; the benchmark stays manual.
+      VOLUMES_TEST_PREPARE_SNAPSHOT: ${{ (github.event_name == 'schedule' || inputs.snapshot) && '1' || '' }}
+      VOLUMES_TEST_THROUGHPUT: ${{ inputs.throughput && '1' || '' }}
+    steps:
+      - name: Check configuration
+        id: config
+        run: |
+          missing=""
+          for name in FREESTYLE_API_KEY VOLUMES_S3_ACCESS_KEY_ID VOLUMES_S3_SECRET_ACCESS_KEY VOLUMES_S3_BUCKET; do
+            [ -n "$(printenv "$name")" ] || missing="$missing $name"
+          done
+          if [ -z "$missing" ]; then
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+          elif [ "$GITHUB_EVENT_NAME" = "schedule" ]; then
+            echo "::notice::Skipping the scheduled live test: missing repository secrets or variables:$missing"
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "::error::Missing repository secrets or variables:$missing"
+            exit 1
+          fi
+      - if: steps.config.outputs.ready == 'true'
+        uses: actions/checkout@v4
+      - if: steps.config.outputs.ready == 'true'
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.15.1
+      - if: steps.config.outputs.ready == 'true'
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - if: steps.config.outputs.ready == 'true'
+        run: pnpm install --frozen-lockfile
+      - if: steps.config.outputs.ready == 'true'
+        run: pnpm test:freestyle

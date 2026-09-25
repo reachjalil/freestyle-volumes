@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { inspect } from 'node:util';
 import { StorageError } from '../../dist/errors.js';
 import { VolumeRegistry } from '../../dist/registry.js';
-import { resolveStorage, rcloneRemoteEnv, toStorageError, MemoryObjectStore, S3ObjectStore, ValidationError } from '../../dist/index.js';
+import { resolveStorage, storageConfigFromEnv, rcloneRemoteEnv, toStorageError, MemoryObjectStore, S3ObjectStore, ValidationError } from '../../dist/index.js';
 import { PutObjectCommand, CopyObjectCommand, HeadObjectCommand, GetObjectTaggingCommand, CreateMultipartUploadCommand, UploadPartCopyCommand, CompleteMultipartUploadCommand, AbortMultipartUploadCommand, S3Client } from '@aws-sdk/client-s3';
 import { MAX_SINGLE_COPY_BYTES, MAX_MULTIPART_COPY_BYTES, MIN_MULTIPART_COPY_PART_BYTES, DEFAULT_MULTIPART_COPY_PART_BYTES, MAX_MULTIPART_COPY_PARTS } from '../../dist/storage.js';
 import { storage } from '../helpers/fake-sandbox.mjs';
@@ -482,4 +482,31 @@ test('a retried conditional PUT returning 412 is ambiguous, never a proven rejec
   const store = new S3ObjectStore(resolveStorage(storage), client);
   await assert.rejects(store.putObjectIfAbsent('ns/target', 'record'), { code: 'STORAGE_ERROR' });
   assert.equal(attempts, 2);
+});
+
+test('storageConfigFromEnv reads the VOLUMES_S3_* convention shared by the CLI, examples and live tests', () => {
+  const required = { VOLUMES_S3_BUCKET: 'my-volumes', VOLUMES_S3_ACCESS_KEY_ID: 'id', VOLUMES_S3_SECRET_ACCESS_KEY: 'secret' };
+  assert.deepEqual(storageConfigFromEnv(required), { bucket: 'my-volumes', accessKeyId: 'id', secretAccessKey: 'secret' });
+  const full = storageConfigFromEnv({
+    ...required,
+    VOLUMES_S3_ENDPOINT: 'https://acct.r2.cloudflarestorage.com',
+    VOLUMES_S3_SANDBOX_ENDPOINT: 'http://minio:9000',
+    VOLUMES_S3_REGION: 'auto',
+    VOLUMES_S3_PREFIX: 'my-app',
+    VOLUMES_S3_PROVIDER: 'Cloudflare',
+    VOLUMES_S3_SESSION_TOKEN: 'session',
+    VOLUMES_S3_FORCE_PATH_STYLE: '0',
+    UNRELATED: 'ignored',
+  });
+  assert.deepEqual(full, {
+    ...{ bucket: 'my-volumes', accessKeyId: 'id', secretAccessKey: 'secret' },
+    endpoint: 'https://acct.r2.cloudflarestorage.com', sandboxEndpoint: 'http://minio:9000', region: 'auto', prefix: 'my-app',
+    provider: 'Cloudflare', sessionToken: 'session', forcePathStyle: false,
+  });
+  assert.equal(resolveStorage(full).prefix, 'my-app', 'the result is a valid StorageConfig');
+  assert.equal(storageConfigFromEnv({ ...required, VOLUMES_S3_FORCE_PATH_STYLE: 'true' }).forcePathStyle, true);
+  assert.deepEqual(storageConfigFromEnv({ ...required, VOLUMES_S3_ENDPOINT: '', VOLUMES_S3_PREFIX: '' }), { bucket: 'my-volumes', accessKeyId: 'id', secretAccessKey: 'secret' }, 'empty variables count as unset');
+
+  assert.throws(() => storageConfigFromEnv({ VOLUMES_S3_BUCKET: 'b', VOLUMES_S3_SECRET_ACCESS_KEY: '' }), (error) => error instanceof ValidationError && /Missing environment variables: VOLUMES_S3_ACCESS_KEY_ID, VOLUMES_S3_SECRET_ACCESS_KEY\./.test(error.message));
+  assert.throws(() => storageConfigFromEnv({ ...required, VOLUMES_S3_FORCE_PATH_STYLE: 'yes' }), ValidationError);
 });

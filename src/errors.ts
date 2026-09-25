@@ -8,6 +8,7 @@ export type VolumeErrorCode =
   | 'VOLUME_NOT_FOUND'
   | 'VOLUME_ALREADY_EXISTS'
   | 'VOLUME_IN_USE'
+  | 'VOLUME_DELETING'
   | 'CONFIRMATION_REQUIRED'
   | 'STORAGE_AUTH'
   | 'STORAGE_UNREACHABLE'
@@ -23,6 +24,7 @@ export type VolumeErrorCode =
   | 'MOUNT_STALE'
   | 'MOUNT_BUSY'
   | 'MOUNT_UNMANAGED'
+  | 'MOUNT_NOT_FOUND'
   | 'FLUSH_FAILED'
   | 'UNSUPPORTED';
 
@@ -101,7 +103,8 @@ export type MountErrorCode =
   | 'MOUNT_PATH_IN_USE'
   | 'MOUNT_STALE'
   | 'MOUNT_BUSY'
-  | 'MOUNT_UNMANAGED';
+  | 'MOUNT_UNMANAGED'
+  | 'MOUNT_NOT_FOUND';
 
 export class MountError extends VolumeError {
   constructor(code: MountErrorCode, message: string, options: VolumeErrorOptions = {}) {

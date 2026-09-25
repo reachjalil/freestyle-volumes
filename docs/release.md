@@ -1,34 +1,72 @@
-# Releases
+# Releasing to npm
 
-## v0.1.0 — first preview
+`freestyle-volumes` is published to npm as an unscoped public package. Versions follow semver with the usual `0.x` rule: a breaking change bumps the minor version (`0.2.0` → `0.3.0`), anything else the patch version. Every release gets a `CHANGELOG.md` entry.
 
-Scope: the rclone backend, the Freestyle and Docker adapters, the Daytona-style API, unit and Linux integration tests, and documentation. Verification records live in `docs/evidence/`.
+`npm publish` protects itself: `prepublishOnly` runs `npm run verify` (unit tests, the SDK and example type checks, and the package smoke test that installs the packed tarball into a fresh project), and `prepack` rebuilds `dist/` from a clean directory. A failing check stops the publish before anything is uploaded.
 
-Not published to npm. Installation is from GitHub (`npm install github:reachjalil/freestyle-volumes`), which runs `prepare` to build `dist/`.
+## First release (0.2.0)
 
-## Unreleased safety, multipart clone, Git and performance changes
+npm only lets you add a trusted publisher to a package that already exists, so the first version is published from a maintainer's machine:
 
-- Mounts use `rclone rcd` with RC `mount/mount`. Normal detach externally unmounts, waits for FUSE serving to stop, drains the retained VFS, then stops the process and removes verified-clean cache/state.
-- `FLUSH_FAILED` may leave the mount gone but uploader/cache/state retained: restore storage access and retry detach. Forced uncertain detach retains recovery state/cache and the advisory attachment record; it does not guarantee durability or override unsafe process cleanup.
-- Guest lifecycle operations require per-path `flock`, reject symlink paths/ancestors, and validate process identity before signaling. Failed attach retains recovery evidence.
-- Mount/cache identity now includes resolved host and guest endpoints, bucket, prefix, region, provider and path-style mode as well as volume/subpath/path. Credentials and request timeouts are excluded. Legacy state/cache is not automatically migrated or rebound; missing identity evidence can require operator recovery.
-- **Custom-store contract change:** implement atomic `ObjectStore.putObjectIfAbsent(key, body): Promise<boolean>`. S3 uses `If-None-Match: *`; unsupported or ambiguous conditional writes fail rather than falling back to overwrite. Registry records must pass strict shape and exact-prefix validation.
-- Attachment records are still advisory. Atomic creation and guest locks do not solve distributed attach/delete or create/delete races; application orchestration remains necessary.
-- **Clone:** same-bucket/namespace conditional server-side copies, with source ETags and atomic conditional destination publication. Caller-coordinated quiescence is required; advisory attachment checks and `allowLiveSource` do not provide snapshots, COW or ACID. Single copy applies at or below `storage.multipartCopyThresholdBytes` (default 5 GiB); multipart copy supports larger objects up to a conservative 5 TiB per object. `multipartCopyPartSizeBytes` defaults to 128 MiB (minimum configured 5 MiB), adaptively grows to stay within 10,000 parts, and parts are sequential per object, keeping clone concurrency an upper bound. HEAD checks source size/ETag and pins available versions; every part is ETag-conditional. Supported HEAD metadata and separately read tags are preserved; verify provider version/tag/multipart/abort permissions. Selection is capped at 100,000 objects and 32 MiB UTF-8 JSON metadata, with lower configurable budgets.
-- **Layout compatibility:** new creates/clones write v2 generation prefixes; existing v1 records are supported, but older v1-only clients cannot read v2. Upgrade all namespace participants before writing new records. Always consume stored `dataPrefix`; generation also changes mount/cache identity.
-- **Failure handling:** clone ownership intents remain even on success. Unknown completion or publication retains data; other failed copies/cleanup yield `cleanupStatus: 'uncertain'` because remote work can finish late. Expose upload/stage/abort diagnostics and abort failures; acknowledged abort does not prove destination absence. Reconcile provider uploads and late objects; recommend incomplete-MPU lifecycle cleanup, not age-based deletion of generations. There is no automatic GC/resume. See [reconciliation](semantics.md#clone-publication-and-reconciliation).
-- **Git and exports:** `VolumeGit`, `volumeGit`, `VolumeGitError` and types are available at the root and `/git`; copy constants are exported at the root. Explicit clone/status/path-selected commit with identity, clean ff-only pull, normal push and directional sync; no automatic commits, PRs or GitHub REST. Requires preinstalled Git, credential-free HTTPS (or GitHub `owner/name`), env-only tokens with temporary askpass and a trusted adapter/guest that does not log env. Restricted repositories only: hooks disabled, filters/submodules/linked worktrees/symlinks and unsafe layouts/configuration rejected. Single-writer coordination and separate verified detach are required; results are guest-local, not ACID or S3 durability. Prefer native active worktrees. See [Git guide](git.md).
-- **Tuning:** `list({ concurrency? })` and clone concurrency default to 8 (1–64). Mount `bufferSize`, `readAhead`, `readChunkSize`, `readChunkSizeLimit` and `transfers` are opt-in with unchanged defaults; full-cache mode is required for read-ahead to take effect. See [performance](performance.md), [research rationale](freestyle-research.md) and [local-only benchmark evidence](evidence/performance-local.md).
+```bash
+git checkout main && git pull
+pnpm install --frozen-lockfile
+npm login                # browser sign-in
+npm publish --dry-run    # full verification and the exact file list; uploads nothing
+npm publish              # npm asks for your second factor if your account uses one
+git tag v0.2.0 && git push origin v0.2.0
+```
 
-**Final main-run verification — 2026-09-18:** `pnpm test`: 112 passed, 0 skipped; `pnpm check:types` and `pnpm check:examples` passed. `VOLUMES_TEST_BOOTSTRAP=1 pnpm test:integration`: 26 passed, 0 failed, 0 skipped, including a small multipart fixture, real-FUSE Git, minimum/pinned rclone 1.68.0/1.75.1 and Ubuntu bootstrap. Large multipart boundaries are mocked, not actual 5 TiB copies. Git coverage is unit/local smart HTTP plus real FUSE, not live authenticated GitHub. `pnpm test:freestyle`: 1 skipped for missing `FREESTYLE_API_KEY`, `VOLUMES_S3_BUCKET`, `VOLUMES_S3_ACCESS_KEY_ID`, and `VOLUMES_S3_SECRET_ACCESS_KEY`; no live round trip or pause/resume behavior is validated. Earlier 85/17 counts and CI links in [evidence/v0.1.md](evidence/v0.1.md) remain historical; they certify only their older revisions.
+Then check `https://www.npmjs.com/package/freestyle-volumes` and try `npm install freestyle-volumes freestyle` in a scratch project. Optionally publish a GitHub release for the tag (`gh release create v0.2.0 --generate-notes`). The release workflow runs, finds 0.2.0 already on npm and skips the upload.
 
-## Checklist before a release
+## Later releases from GitHub (recommended)
 
-1. `pnpm install --frozen-lockfile`
-2. `pnpm test`, `pnpm check:types`, `pnpm check:examples`
-3. `VOLUMES_TEST_BOOTSTRAP=1 pnpm test:integration` on a Linux host with Docker (CI does this)
-4. `pnpm test:freestyle` with a real Freestyle key and bucket; record the outcome in `docs/evidence/`
-5. `pnpm pack` and inspect the archive: `dist/`, `README.md`, `LICENSE` only
-6. Update `CHANGELOG.md`, bump `package.json` version, tag `vX.Y.Z`
+One-time setup: on npmjs.com, open the package's **Settings → Trusted publishing** and add a GitHub Actions publisher with owner `reachjalil`, repository `freestyle-volumes` and workflow `release.yml`. The workflow then authenticates with OIDC, with no long-lived token to leak, and every version carries a provenance attestation. If you prefer a token instead, store a granular npm access token with publish rights as the repository secret `NPM_TOKEN`.
 
-Publishing to npm needs a separate decision; nothing in the repository publishes automatically.
+For each release:
+
+1. Move the changes into a new `## X.Y.Z — YYYY-MM-DD` section of `CHANGELOG.md` and commit.
+2. Bump the version; this commits `package.json` and creates the tag `vX.Y.Z`:
+   ```bash
+   npm version patch      # or: npm version minor
+   git push --follow-tags
+   ```
+3. Publish a GitHub release for the tag:
+   ```bash
+   gh release create "v$(node -p "require('./package.json').version")" --generate-notes
+   ```
+
+[`release.yml`](../.github/workflows/release.yml) checks that the tag matches `package.json`, reruns the unit tests, type checks and package smoke test, and publishes with `--provenance`. Versions that are already on npm are skipped, and prerelease versions (`0.3.0-beta.0`, from `npm version prerelease --preid beta`) go to the `next` dist-tag instead of `latest`. It can also be started by hand from `main` (**Actions → Release → Run workflow**).
+
+## Later releases from your machine
+
+```bash
+npm version patch && git push --follow-tags && npm publish
+```
+
+## Before a release
+
+1. `pnpm install --frozen-lockfile`.
+2. `npm publish --dry-run`: runs `pnpm test`, `pnpm check:types`, `pnpm check:examples` and `pnpm test:package`, then lists the tarball: `dist/`, `src/`, `README.md`, `LICENSE`, `CHANGELOG.md` and `package.json` only.
+3. `VOLUMES_TEST_BOOTSTRAP=1 pnpm test:integration` on a host with Docker. CI runs it on every push.
+4. The live Freestyle tests (billed, a few minutes of small VMs): run the manual **Freestyle live test** workflow, which reads repository secrets and variables, or locally with the key and bucket settings in gitignored env files:
+   ```bash
+   VOLUMES_TEST_PREPARE_SNAPSHOT=1 node --env-file=.env.freestyle --env-file=.env.r2 --test --test-concurrency=1 test/freestyle/*.test.mjs
+   ```
+   where `.env.r2` holds `VOLUMES_S3_ENDPOINT`, `VOLUMES_S3_REGION`, `VOLUMES_S3_PROVIDER`, `VOLUMES_S3_BUCKET` and the two keys. Record the outcome in `docs/evidence/`.
+5. Update `CHANGELOG.md` and the README's project status, then bump the version and tag `vX.Y.Z`.
+
+## When a release is broken
+
+Publish a fixed patch version, then deprecate the broken one so installs warn:
+
+```bash
+npm deprecate freestyle-volumes@0.2.1 "Use 0.2.2 instead: <what is broken>"
+```
+
+Treat `npm unpublish` as a last resort: npm allows it freely only within 72 hours of publishing, never while other packages depend on the version, and a published version number can never be reused.
+
+## History
+
+- **0.2.0 (2026-09-25):** first npm release. See the [changelog](../CHANGELOG.md#020--2026-09-25) and [verification record](evidence/v0.2.md).
+- **0.1.0 (2026-09-17):** GitHub-only preview (`npm install github:reachjalil/freestyle-volumes`), never published to npm. Its verification history is in [evidence/v0.1.md](evidence/v0.1.md).

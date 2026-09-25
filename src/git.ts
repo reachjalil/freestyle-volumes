@@ -282,11 +282,10 @@ safe_git() {
 check_repository() {
   [ -d "$REPO/.git" ] && [ ! -L "$REPO/.git" ] || exit 80
   [ -f "$REPO/.git/config" ] || exit 80
-  find "$REPO" \\( ! -type d ! -type f \\) -print > "$TMP/unsafe" || exit 80
-  [ ! -s "$TMP/unsafe" ] || exit 80
-  find "$REPO" -type f -links +1 -print > "$TMP/unsafe" || exit 80
-  [ ! -s "$TMP/unsafe" ] || exit 80
-  find "$REPO" -mindepth 2 -iname .git -print > "$TMP/unsafe" || exit 80
+  # One walk of the tree (each directory is a listing request on the object
+  # store): anything but a plain file or directory, hard-linked files, and any
+  # .git entry other than the repository's own.
+  find "$REPO" \\( \\( ! -type d ! -type f \\) -o \\( -type f -links +1 \\) -o \\( -iname .git ! -path "$REPO/.git" \\) \\) -print > "$TMP/unsafe" || exit 80
   [ ! -s "$TMP/unsafe" ] || exit 80
   for forbidden in commondir objects/info/alternates objects/info/http-alternates info/grafts MERGE_HEAD CHERRY_PICK_HEAD REVERT_HEAD rebase-merge rebase-apply sequencer; do
     [ ! -e "$REPO/.git/$forbidden" ] || exit 80

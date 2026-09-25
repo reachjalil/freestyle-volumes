@@ -1,5 +1,5 @@
 // Linux FUSE integration tests. They need Docker (containers get /dev/fuse) and
-// pull quay.io/minio/minio and rclone/rclone. They run the real library end to
+// pull cgr.dev/chainguard/minio and rclone/rclone. They run the real library end to
 // end: real rclone mounts, real object storage, real process crashes.
 // These are NOT Freestyle tests; see test/freestyle for those.
 import { test, describe, before, after } from 'node:test';

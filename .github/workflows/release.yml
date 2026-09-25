@@ -1,0 +1,58 @@
+name: Release
+# Publishes to npm when a GitHub release is published, or on a manual run from
+# main. Authenticates with npm trusted publishing (OIDC) once it is configured
+# for this repository on npmjs.com, otherwise with the NPM_TOKEN secret.
+# Skips versions that are already on npm, so publishing locally first is safe.
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+permissions:
+  contents: read
+  id-token: write # npm trusted publishing and provenance
+concurrency:
+  group: release
+  cancel-in-progress: false
+jobs:
+  publish:
+    if: github.event_name == 'release' || github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10.15.1
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+          registry-url: https://registry.npmjs.org
+      - name: Use npm 11 (trusted publishing needs npm 11.5.1 or later)
+        run: npm install -g npm@11
+      - run: pnpm install --frozen-lockfile
+      - name: Check that the release tag matches package.json
+        if: github.event_name == 'release'
+        run: |
+          version="$(node -p "require('./package.json').version")"
+          if [ "$GITHUB_REF_NAME" != "v$version" ]; then
+            echo "::error::Release tag $GITHUB_REF_NAME does not match package.json version $version (expected v$version)."
+            exit 1
+          fi
+      - run: pnpm test
+      - run: pnpm check:types
+      - run: pnpm check:examples
+      - run: pnpm test:package
+      - name: Publish to npm
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          name="$(node -p "require('./package.json').name")"
+          version="$(node -p "require('./package.json').version")"
+          if npm view "$name@$version" version >/dev/null 2>&1; then
+            echo "$name@$version is already on npm; nothing to publish."
+            exit 0
+          fi
+          tag=latest
+          case "$version" in *-*) tag=next ;; esac
+          # dist/ was built and verified by the steps above.
+          npm publish --provenance --access public --tag "$tag" --ignore-scripts

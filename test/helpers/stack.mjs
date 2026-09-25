@@ -6,7 +6,10 @@ import { spawnSync } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
 import { S3Client, CreateBucketCommand, ListObjectsV2Command, GetObjectCommand } from '@aws-sdk/client-s3';
 
-export const MINIO_IMAGE = process.env.VOLUMES_TEST_MINIO_IMAGE ?? 'quay.io/minio/minio:latest';
+// MinIO no longer publishes public images (quay.io/minio/minio and minio/minio now refuse
+// anonymous pulls); Chainguard builds current releases of the server and the client.
+export const MINIO_IMAGE = process.env.VOLUMES_TEST_MINIO_IMAGE ?? 'cgr.dev/chainguard/minio:latest';
+export const MC_IMAGE = process.env.VOLUMES_TEST_MC_IMAGE ?? 'cgr.dev/chainguard/minio-client:latest';
 export const SANDBOX_IMAGE = process.env.VOLUMES_TEST_SANDBOX_IMAGE ?? 'rclone/rclone:latest';
 
 export function dockerAvailable() {
@@ -89,6 +92,12 @@ export class Stack {
   exec(name, command, options = {}) {
     const r = docker(['exec', name, 'sh', '-c', command], { allowFailure: true, ...options });
     return { stdout: r.stdout ?? '', stderr: r.stderr ?? '', status: r.status };
+  }
+
+  /** Run the MinIO client against this stack's server as alias `local`; the admin secret travels in env, not argv. */
+  mc(args, { input } = {}) {
+    const host = `http://${this.accessKeyId}:${this.secretAccessKey}@${this.minio}:9000`;
+    return docker(['run', '--rm', '-i', '--network', this.network, '-e', 'MC_HOST_local', MC_IMAGE, ...args], { env: { ...process.env, MC_HOST_local: host }, input });
   }
 
   /** Run a command detached inside the sandbox (background process). */

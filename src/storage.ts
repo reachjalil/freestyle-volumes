@@ -13,6 +13,8 @@ import {
   ListObjectsV2Command,
   PutObjectCommand,
   S3Client,
+  type ServerSideEncryption,
+  type StorageClass,
 } from '@aws-sdk/client-s3';
 import { createHash } from 'node:crypto';
 import { StorageError, ValidationError, type StorageErrorCode } from './errors.js';
@@ -43,6 +45,25 @@ export interface StorageConfig {
   requestTimeoutMs?: number;
   multipartCopyThresholdBytes?: number;
   multipartCopyPartSizeBytes?: number;
+  /**
+   * Server-side encryption header on every object this library and rclone write:
+   * `AES256` (SSE-S3) or `aws:kms` (SSE-KMS). Omit to rely on the bucket default,
+   * which is the only option on providers without these headers (Cloudflare R2).
+   */
+  serverSideEncryption?: 'AES256' | 'aws:kms';
+  /** KMS key id, alias or ARN for `aws:kms`. Omit for the AWS-managed key. */
+  sseKmsKeyId?: string;
+  /** Storage class for volume data (rclone uploads and clone copies), e.g. `STANDARD_IA`. Small records keep the bucket default. */
+  storageClass?: string;
+}
+
+/** Credentials for the rclone process inside a sandbox, when they should differ from the host's. */
+export interface SandboxCredentials {
+  accessKeyId: string;
+  secretAccessKey: string;
+  sessionToken?: string;
+  /** When temporary credentials stop working. Recorded with the mount and reported by inspect and listMounts. */
+  expiresAt?: string | Date;
 }
 
 export interface ResolvedStorage {
@@ -59,12 +80,35 @@ export interface ResolvedStorage {
   requestTimeoutMs: number;
   multipartCopyThresholdBytes: number;
   multipartCopyPartSizeBytes: number;
+  serverSideEncryption: 'AES256' | 'aws:kms' | undefined;
+  sseKmsKeyId: string | undefined;
+  storageClass: string | undefined;
 }
 
 export const DEFAULT_PREFIX = 'freestyle-volumes';
 /** Name of the rclone remote defined through environment variables inside the sandbox. */
 export const RCLONE_REMOTE = 'fsvol';
 const PROVIDER = /^[A-Za-z][A-Za-z0-9 ]{0,31}$/;
+const STORAGE_CLASS = /^[A-Z][A-Z0-9_]{0,31}$/;
+/** KMS key ids, aliases and ARNs: no quotes, spaces or shell metacharacters. */
+const KMS_KEY_ID = /^[A-Za-z0-9:/_.+=@-]{1,2048}$/;
+
+function resolveEncryption(config: StorageConfig): Pick<ResolvedStorage, 'serverSideEncryption' | 'sseKmsKeyId' | 'storageClass'> {
+  const sse = config.serverSideEncryption;
+  if (sse !== undefined && sse !== 'AES256' && sse !== 'aws:kms') {
+    throw new ValidationError(`storage.serverSideEncryption must be "AES256" or "aws:kms", got ${JSON.stringify(sse)}.`);
+  }
+  const kmsKey = config.sseKmsKeyId;
+  if (kmsKey !== undefined) {
+    if (sse !== 'aws:kms') throw new ValidationError('storage.sseKmsKeyId needs storage.serverSideEncryption: "aws:kms".');
+    if (typeof kmsKey !== 'string' || !KMS_KEY_ID.test(kmsKey)) throw new ValidationError(`storage.sseKmsKeyId ${JSON.stringify(kmsKey)} is not a KMS key id, alias or ARN.`);
+  }
+  const storageClass = config.storageClass;
+  if (storageClass !== undefined && (typeof storageClass !== 'string' || !STORAGE_CLASS.test(storageClass))) {
+    throw new ValidationError(`storage.storageClass ${JSON.stringify(storageClass)} must be an S3 storage class such as "STANDARD_IA".`);
+  }
+  return { serverSideEncryption: sse, sseKmsKeyId: kmsKey, storageClass };
+}
 
 export function resolveStorage(config: StorageConfig): ResolvedStorage {
   if (!config || typeof config !== 'object') throw new ValidationError('storage configuration is required.');
@@ -88,7 +132,72 @@ export function resolveStorage(config: StorageConfig): ResolvedStorage {
     requestTimeoutMs: assertInteger('storage.requestTimeoutMs', config.requestTimeoutMs ?? 15000, 1000, 300000),
     multipartCopyThresholdBytes: assertInteger('storage.multipartCopyThresholdBytes', config.multipartCopyThresholdBytes === undefined ? MAX_SINGLE_COPY_BYTES : config.multipartCopyThresholdBytes, MIN_MULTIPART_COPY_PART_BYTES, MAX_SINGLE_COPY_BYTES),
     multipartCopyPartSizeBytes: assertInteger('storage.multipartCopyPartSizeBytes', config.multipartCopyPartSizeBytes === undefined ? DEFAULT_MULTIPART_COPY_PART_BYTES : config.multipartCopyPartSizeBytes, MIN_MULTIPART_COPY_PART_BYTES, MAX_SINGLE_COPY_BYTES),
+    ...resolveEncryption(config),
   };
+}
+
+/** Validate credentials meant for a sandbox. Error messages name the field, never the value. */
+export function resolveSandboxCredentials(credentials: SandboxCredentials, source = 'sandboxCredentials'): { accessKeyId: string; secretAccessKey: string; sessionToken: string | undefined; expiresAt: string | null } {
+  if (!credentials || typeof credentials !== 'object') throw new ValidationError(`${source} must return an object with accessKeyId and secretAccessKey.`);
+  let expiresAt: string | null = null;
+  if (credentials.expiresAt !== undefined) {
+    const time = credentials.expiresAt instanceof Date ? credentials.expiresAt.getTime() : typeof credentials.expiresAt === 'string' ? Date.parse(credentials.expiresAt) : Number.NaN;
+    if (!Number.isFinite(time)) throw new ValidationError(`${source}.expiresAt must be a Date or an ISO 8601 time.`);
+    expiresAt = new Date(time).toISOString();
+  }
+  return {
+    accessKeyId: assertEnvValue(`${source}.accessKeyId`, credentials.accessKeyId),
+    secretAccessKey: assertEnvValue(`${source}.secretAccessKey`, credentials.secretAccessKey),
+    sessionToken: credentials.sessionToken === undefined ? undefined : assertEnvValue(`${source}.sessionToken`, credentials.sessionToken),
+    expiresAt,
+  };
+}
+
+/**
+ * Storage configuration from the `VOLUMES_S3_*` environment variables that the
+ * CLI, the examples and the live tests share (see `.env.example`). Empty
+ * variables count as unset. Throws a {@link ValidationError} naming every
+ * missing required variable; the values themselves are validated later by
+ * {@link resolveStorage}.
+ *
+ * @example
+ * const volumes = new FreestyleVolumes({ storage: storageConfigFromEnv(), sandboxes: freestyleSandboxes(freestyle) });
+ */
+export function storageConfigFromEnv(env: Record<string, string | undefined> = process.env): StorageConfig {
+  const missing = ['VOLUMES_S3_BUCKET', 'VOLUMES_S3_ACCESS_KEY_ID', 'VOLUMES_S3_SECRET_ACCESS_KEY'].filter((key) => !env[key]);
+  if (missing.length > 0) {
+    throw new ValidationError(`Missing environment variables: ${missing.join(', ')}.`, { hint: 'Every VOLUMES_S3_* variable is listed in .env.example.' });
+  }
+  const config: StorageConfig = { bucket: env.VOLUMES_S3_BUCKET!, accessKeyId: env.VOLUMES_S3_ACCESS_KEY_ID!, secretAccessKey: env.VOLUMES_S3_SECRET_ACCESS_KEY! };
+  if (env.VOLUMES_S3_ENDPOINT) config.endpoint = env.VOLUMES_S3_ENDPOINT;
+  if (env.VOLUMES_S3_SANDBOX_ENDPOINT) config.sandboxEndpoint = env.VOLUMES_S3_SANDBOX_ENDPOINT;
+  if (env.VOLUMES_S3_REGION) config.region = env.VOLUMES_S3_REGION;
+  if (env.VOLUMES_S3_PREFIX) config.prefix = env.VOLUMES_S3_PREFIX;
+  if (env.VOLUMES_S3_PROVIDER) config.provider = env.VOLUMES_S3_PROVIDER;
+  if (env.VOLUMES_S3_SESSION_TOKEN) config.sessionToken = env.VOLUMES_S3_SESSION_TOKEN;
+  const pathStyle = env.VOLUMES_S3_FORCE_PATH_STYLE;
+  if (pathStyle) {
+    if (!['true', 'false', '1', '0'].includes(pathStyle)) throw new ValidationError(`VOLUMES_S3_FORCE_PATH_STYLE must be true or false, got ${JSON.stringify(pathStyle)}.`);
+    config.forcePathStyle = pathStyle === 'true' || pathStyle === '1';
+  }
+  if (env.VOLUMES_S3_SSE) config.serverSideEncryption = env.VOLUMES_S3_SSE as StorageConfig['serverSideEncryption'];
+  if (env.VOLUMES_S3_SSE_KMS_KEY_ID) config.sseKmsKeyId = env.VOLUMES_S3_SSE_KMS_KEY_ID;
+  if (env.VOLUMES_S3_STORAGE_CLASS) config.storageClass = env.VOLUMES_S3_STORAGE_CLASS;
+  return config;
+}
+
+/**
+ * Separate credentials for the rclone process in each VM, from
+ * `VOLUMES_S3_SANDBOX_ACCESS_KEY_ID`, `VOLUMES_S3_SANDBOX_SECRET_ACCESS_KEY` and
+ * `VOLUMES_S3_SANDBOX_SESSION_TOKEN`. Undefined when neither key is set, so the
+ * host credentials are used. Pass the result as `sandboxCredentials`.
+ */
+export function sandboxCredentialsFromEnv(env: Record<string, string | undefined> = process.env): SandboxCredentials | undefined {
+  const id = env.VOLUMES_S3_SANDBOX_ACCESS_KEY_ID;
+  const secret = env.VOLUMES_S3_SANDBOX_SECRET_ACCESS_KEY;
+  if (!id && !secret) return undefined;
+  if (!id || !secret) throw new ValidationError('Set both VOLUMES_S3_SANDBOX_ACCESS_KEY_ID and VOLUMES_S3_SANDBOX_SECRET_ACCESS_KEY, or neither.');
+  return env.VOLUMES_S3_SANDBOX_SESSION_TOKEN ? { accessKeyId: id, secretAccessKey: secret, sessionToken: env.VOLUMES_S3_SANDBOX_SESSION_TOKEN } : { accessKeyId: id, secretAccessKey: secret };
 }
 
 /**
@@ -111,6 +220,9 @@ export function rcloneRemoteEnv(storage: ResolvedStorage): Record<string, string
   };
   if (storage.sandboxEndpoint) env[key('ENDPOINT')] = storage.sandboxEndpoint;
   if (storage.sessionToken) env[key('SESSION_TOKEN')] = storage.sessionToken;
+  if (storage.serverSideEncryption) env[key('SERVER_SIDE_ENCRYPTION')] = storage.serverSideEncryption;
+  if (storage.sseKmsKeyId) env[key('SSE_KMS_KEY_ID')] = storage.sseKmsKeyId;
+  if (storage.storageClass) env[key('STORAGE_CLASS')] = storage.storageClass;
   return env;
 }
 
@@ -145,6 +257,31 @@ export interface ObjectStore {
   deleteObject(key: string): Promise<void>;
   deleteObjects(keys: string[]): Promise<void>;
   listObjects(prefix: string, options?: { limit?: number }): AsyncIterable<ObjectSummary>;
+  /**
+   * The immediate "subdirectories" of a prefix that ends in "/" (a delimiter
+   * listing), each returned with its trailing "/". Optional: callers fall back
+   * to a full listing, which costs one request per 1,000 objects.
+   */
+  listPrefixes?(prefix: string): AsyncIterable<string>;
+}
+
+/** Immediate child prefixes of `prefix`, derived from a full listing when the store has no delimiter listing. */
+export async function* childPrefixes(store: ObjectStore, prefix: string): AsyncIterable<string> {
+  if (typeof store.listPrefixes === 'function') {
+    yield* store.listPrefixes(prefix);
+    return;
+  }
+  const seen = new Set<string>();
+  for await (const object of store.listObjects(prefix)) {
+    const rest = object.key.slice(prefix.length);
+    const slash = rest.indexOf('/');
+    if (!object.key.startsWith(prefix) || slash <= 0) continue;
+    const child = `${prefix}${rest.slice(0, slash + 1)}`;
+    if (!seen.has(child)) {
+      seen.add(child);
+      yield child;
+    }
+  }
 }
 
 const AUTH_NAMES = new Set(['InvalidAccessKeyId', 'SignatureDoesNotMatch', 'AccessDenied', 'AuthorizationHeaderMalformed', 'InvalidToken', 'ExpiredToken', 'CredentialsProviderError']);
@@ -204,12 +341,21 @@ export class S3ObjectStore implements ObjectStore {
   private readonly timeoutMs: number;
   private readonly multipartCopyThresholdBytes: number;
   private readonly multipartCopyPartSizeBytes: number;
+  /** SSE headers for every write, records included: bucket policies that require them apply to all PUTs. */
+  private readonly encryption: { ServerSideEncryption?: ServerSideEncryption; SSEKMSKeyId?: string };
+  /** Storage class for copied volume data only; tiny records stay in the bucket default. */
+  private readonly dataClass: { StorageClass?: StorageClass };
 
   constructor(storage: ResolvedStorage, client?: S3Client) {
     this.bucket = storage.bucket;
     this.timeoutMs = storage.requestTimeoutMs;
     this.multipartCopyThresholdBytes = storage.multipartCopyThresholdBytes;
     this.multipartCopyPartSizeBytes = storage.multipartCopyPartSizeBytes;
+    this.encryption = {
+      ...(storage.serverSideEncryption ? { ServerSideEncryption: storage.serverSideEncryption as ServerSideEncryption } : {}),
+      ...(storage.sseKmsKeyId ? { SSEKMSKeyId: storage.sseKmsKeyId } : {}),
+    };
+    this.dataClass = storage.storageClass ? { StorageClass: storage.storageClass as StorageClass } : {};
     this.client =
       client ??
       new S3Client({
@@ -254,6 +400,7 @@ export class S3ObjectStore implements ObjectStore {
         const copied = await this.client.send(new CopyObjectCommand({
           Bucket: this.bucket, Key: destinationKey, CopySource: copySource,
           CopySourceIfMatch: options.sourceIfMatch,
+          ...this.encryption, ...this.dataClass,
         }), { abortSignal: this.signal() });
         completionStatus = 'unknown';
         if (!validEtag(copied?.CopyObjectResult?.ETag)) {
@@ -278,6 +425,7 @@ export class S3ObjectStore implements ObjectStore {
         ContentLanguage: head.ContentLanguage, ContentDisposition: head.ContentDisposition,
         CacheControl: head.CacheControl, Expires: head.Expires, Metadata: head.Metadata,
         ...(tagging ? { Tagging: tagging } : {}),
+        ...this.encryption, ...this.dataClass,
       }), { abortSignal: this.signal() });
       if (typeof created.UploadId !== 'string' || !created.UploadId.trim()) {
         throw invalidResponse('Multipart creation returned no UploadId; an upload may exist and requires reconciliation.');
@@ -346,7 +494,7 @@ export class S3ObjectStore implements ObjectStore {
 
   async putObject(key: string, body: string): Promise<void> {
     try {
-      await this.client.send(new PutObjectCommand({ Bucket: this.bucket, Key: key, Body: body, ContentType: 'application/json' }), { abortSignal: this.signal() });
+      await this.client.send(new PutObjectCommand({ Bucket: this.bucket, Key: key, Body: body, ContentType: 'application/json', ...this.encryption }), { abortSignal: this.signal() });
     } catch (error) {
       throw toStorageError(error, 'put', this.bucket);
     }
@@ -354,7 +502,7 @@ export class S3ObjectStore implements ObjectStore {
 
   async putObjectIfAbsent(key: string, body: string): Promise<boolean> {
     let attempts = 0;
-    const command = new PutObjectCommand({ Bucket: this.bucket, Key: key, Body: body, ContentType: 'application/json', IfNoneMatch: '*' });
+    const command = new PutObjectCommand({ Bucket: this.bucket, Key: key, Body: body, ContentType: 'application/json', IfNoneMatch: '*', ...this.encryption });
     // A retry may observe our own successful first write. Such a 412 is not
     // proof that this operation never published, so callers must retain data.
     command.middlewareStack.add((next) => async (args) => {
@@ -436,6 +584,25 @@ export class S3ObjectStore implements ObjectStore {
       token = page.IsTruncated ? page.NextContinuationToken : undefined;
     } while (token && remaining > 0);
   }
+
+  async *listPrefixes(prefix: string): AsyncIterable<string> {
+    let token: string | undefined;
+    do {
+      let page;
+      try {
+        page = await this.client.send(
+          new ListObjectsV2Command({ Bucket: this.bucket, Prefix: prefix, Delimiter: '/', ContinuationToken: token, MaxKeys: 1000 }),
+          { abortSignal: this.signal() },
+        );
+      } catch (error) {
+        throw toStorageError(error, 'list', this.bucket);
+      }
+      for (const common of page.CommonPrefixes ?? []) {
+        if (typeof common.Prefix === 'string' && common.Prefix.startsWith(prefix)) yield common.Prefix;
+      }
+      token = page.IsTruncated ? page.NextContinuationToken : undefined;
+    } while (token);
+  }
 }
 
 /** In-memory object store for unit tests and dry runs. */
@@ -502,6 +669,17 @@ export class MemoryObjectStore implements ObjectStore {
         remaining -= 1;
       }
     }
+  }
+
+  async *listPrefixes(prefix: string): AsyncIterable<string> {
+    this.check('list');
+    const children = new Set<string>();
+    for (const key of this.objects.keys()) {
+      if (!key.startsWith(prefix)) continue;
+      const slash = key.indexOf('/', prefix.length);
+      if (slash > prefix.length) children.add(key.slice(0, slash + 1));
+    }
+    yield* [...children].sort();
   }
 }
 
